@@ -556,6 +556,109 @@ impl Interface {
         self.socket_ingress(device, sockets)
     }
 
+    /// Process a batch of pre-received raw frames.
+    ///
+    /// This is an alternative to [`poll_ingress_single()`](Self::poll_ingress_single)
+    /// for devices that perform burst I/O externally (e.g. DPDK `rx_burst`).
+    /// The caller receives a batch of frames from the device and passes them
+    /// here for protocol processing.
+    ///
+    /// Returns a value indicating whether the state of any socket might have changed.
+    ///
+    /// A `device` reference is still required to acquire transmit tokens for
+    /// reply packets (ACKs, RSTs, etc.).
+    pub fn poll_ingress_batch(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        frames: &[&[u8]],
+    ) -> PollResult {
+        self.inner.now = timestamp;
+
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragments.assembler.remove_expired(timestamp);
+
+        let mut result = PollResult::None;
+
+        for frame in frames {
+            if frame.is_empty() {
+                continue;
+            }
+
+            if self.process_ingress_frame(device, sockets, frame) {
+                result = PollResult::SocketStateChanged;
+            }
+        }
+
+        result
+    }
+
+    /// Process a single pre-received frame, dispatching any reply via `device.transmit()`.
+    /// Returns `true` if socket state may have changed.
+    fn process_ingress_frame(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        frame: &[u8],
+    ) -> bool {
+        match self.inner.caps.medium {
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => {
+                if let Some(packet) = self.inner.process_ethernet(
+                    sockets,
+                    PacketMeta::default(),
+                    frame,
+                    &mut self.fragments,
+                ) && let Some(tx_token) = device.transmit(self.inner.now)
+                    && let Err(err) = self.inner.dispatch(tx_token, packet, &mut self.fragmenter)
+                {
+                    net_debug!("Failed to send response: {:?}", err);
+                }
+            }
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => {
+                if let Some(packet) = self.inner.process_ip(
+                    sockets,
+                    PacketMeta::default(),
+                    frame,
+                    &mut self.fragments,
+                ) && let Some(tx_token) = device.transmit(self.inner.now)
+                    && let Err(err) = self.inner.dispatch_ip(
+                        tx_token,
+                        PacketMeta::default(),
+                        packet,
+                        &mut self.fragmenter,
+                    )
+                {
+                    net_debug!("Failed to send response: {:?}", err);
+                }
+            }
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                if let Some(packet) = self.inner.process_ieee802154(
+                    sockets,
+                    PacketMeta::default(),
+                    frame,
+                    &mut self.fragments,
+                ) && let Some(tx_token) = device.transmit(self.inner.now)
+                    && let Err(err) = self.inner.dispatch_ip(
+                        tx_token,
+                        PacketMeta::default(),
+                        packet,
+                        &mut self.fragmenter,
+                    )
+                {
+                    net_debug!("Failed to send response: {:?}", err);
+                }
+            }
+        }
+        // Like socket_ingress(), assume any non-empty frame may have changed socket state.
+        // The frame was processed by the medium-specific handler regardless of whether
+        // a response was generated.
+        true
+    }
+
     /// Maintain stateful processing on the device.
     ///
     /// This is guaranteed to always perform a bounded amount of work.

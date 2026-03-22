@@ -2213,6 +2213,47 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Process a batch of TCP segments destined for this socket.
+    ///
+    /// Intermediate ACK replies are suppressed — only the final reply (if any) is
+    /// returned. This reduces ACK traffic when processing a burst of segments.
+    #[allow(dead_code)] // Used by InterfaceInner::process_tcp_batch and tests.
+    /// The caller is responsible for finding the socket once and passing all
+    /// matching segments here.
+    pub(crate) fn process_batch<'p>(
+        &mut self,
+        cx: &mut Context,
+        segments: &'p [(IpRepr, TcpRepr<'p>)],
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        if segments.is_empty() {
+            return None;
+        }
+
+        // Fast path: single segment, no batching overhead.
+        if segments.len() == 1 {
+            return self.process(cx, &segments[0].0, &segments[0].1);
+        }
+
+        let mut last_reply = None;
+        for (ip_repr, tcp_repr) in segments {
+            let reply = self.process(cx, ip_repr, tcp_repr);
+
+            // Keep the latest reply. For in-order data, process() returns None
+            // (ACK deferred). For out-of-order or control segments, we keep the
+            // last ACK/RST to send, which covers all previously received data.
+            if reply.is_some() {
+                last_reply = reply;
+            }
+
+            // If a RST or FIN closed the socket, stop processing further segments.
+            if self.state == State::Closed || self.state == State::TimeWait {
+                break;
+            }
+        }
+
+        last_reply
+    }
+
     fn timed_out(&self, timestamp: Instant) -> bool {
         match (self.remote_last_ts, self.timeout) {
             (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
@@ -5981,6 +6022,114 @@ mod test {
         assert_eq!(
             call_count, 0,
             "No segments should be emitted when nothing to send"
+        );
+    }
+
+    // IP repr for incoming packets (REMOTE → LOCAL).
+    const RECV_IP_TEMPL: IpRepr = IpReprIpvX(IpvXRepr {
+        src_addr: REMOTE_ADDR,
+        dst_addr: LOCAL_ADDR,
+        next_header: IpProtocol::Tcp,
+        payload_len: 20,
+        hop_limit: 64,
+    });
+
+    #[test]
+    fn test_process_batch_multiple_data_segments() {
+        let mut s = socket_established();
+        s.cx.set_now(Instant::from_millis(0));
+
+        let ip_repr = RECV_IP_TEMPL;
+
+        // Two contiguous data segments from the remote end.
+        let seg1 = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"abc",
+            ..SEND_TEMPL
+        };
+        let seg2 = TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 3,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"def",
+            ..SEND_TEMPL
+        };
+
+        let segments = [(ip_repr.clone(), seg1), (ip_repr, seg2)];
+        let reply = s.socket.process_batch(&mut s.cx, &segments);
+
+        // For in-order data, process() returns None (ACK deferred). process_batch should too.
+        assert!(reply.is_none(), "in-order batch should defer ACK");
+
+        // All 6 bytes should be in the RX buffer.
+        let mut buf = [0u8; 6];
+        let n = s.socket.recv_slice(&mut buf).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(&buf, b"abcdef");
+    }
+
+    #[test]
+    fn test_process_batch_single_segment_same_as_process() {
+        let mut s1 = socket_established();
+        let mut s2 = socket_established();
+        s1.cx.set_now(Instant::from_millis(0));
+        s2.cx.set_now(Instant::from_millis(0));
+
+        let ip_repr = RECV_IP_TEMPL;
+        let seg = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"hello",
+            ..SEND_TEMPL
+        };
+
+        // Single-segment batch should produce same result as process().
+        let reply_batch = s1
+            .socket
+            .process_batch(&mut s1.cx, &[(ip_repr.clone(), seg)]);
+        let reply_single = s2.socket.process(&mut s2.cx, &ip_repr, &seg);
+        assert_eq!(reply_batch, reply_single);
+
+        // Same RX buffer state.
+        let mut buf1 = [0u8; 5];
+        let mut buf2 = [0u8; 5];
+        assert_eq!(
+            s1.socket.recv_slice(&mut buf1),
+            s2.socket.recv_slice(&mut buf2)
+        );
+        assert_eq!(buf1, buf2);
+    }
+
+    #[test]
+    fn test_process_batch_stops_on_rst() {
+        let mut s = socket_established();
+        s.cx.set_now(Instant::from_millis(0));
+
+        let ip_repr = RECV_IP_TEMPL;
+
+        // First segment: RST. Second: data (should not be processed).
+        let rst = TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        };
+        let data = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"xyz",
+            ..SEND_TEMPL
+        };
+
+        let segments = [(ip_repr.clone(), rst), (ip_repr, data)];
+        let _ = s.socket.process_batch(&mut s.cx, &segments);
+
+        // Socket should be closed by the RST.
+        assert_eq!(s.socket.state(), State::Closed);
+        // No data should be in the RX buffer.
+        assert_eq!(
+            s.socket.recv_slice(&mut [0u8; 3]),
+            Err(RecvError::InvalidState)
         );
     }
 

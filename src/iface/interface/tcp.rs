@@ -45,4 +45,47 @@ impl InterfaceInner {
             Some(Packet::new(ip, IpPayload::Tcp(tcp)))
         }
     }
+
+    /// Process a batch of pre-parsed TCP segments destined for the same socket.
+    ///
+    /// Finds the matching socket once (O(N) scan), then calls
+    /// [`Socket::process_batch()`] which suppresses intermediate ACK replies.
+    #[allow(dead_code)] // Public batch API — used by DPDK transport.
+    /// Returns at most one response packet.
+    pub(crate) fn process_tcp_batch<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        handled_by_raw_socket: bool,
+        segments: &'frame [(IpRepr, TcpRepr<'frame>)],
+    ) -> Option<Packet<'frame>> {
+        if segments.is_empty() {
+            return None;
+        }
+
+        // Use the first segment to find the matching socket.
+        let (first_ip, first_tcp) = &segments[0];
+
+        for tcp_socket in sockets
+            .items_mut()
+            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
+        {
+            if tcp_socket.accepts(self, first_ip, first_tcp) {
+                return tcp_socket
+                    .process_batch(self, segments)
+                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+            }
+        }
+
+        // No socket matched — send RST for the first segment.
+        if first_tcp.control == TcpControl::Rst
+            || first_ip.dst_addr().is_unspecified()
+            || first_ip.src_addr().is_unspecified()
+            || handled_by_raw_socket
+        {
+            None
+        } else {
+            let (ip, tcp) = tcp::Socket::rst_reply(first_ip, first_tcp);
+            Some(Packet::new(ip, IpPayload::Tcp(tcp)))
+        }
+    }
 }
