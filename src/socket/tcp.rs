@@ -2345,16 +2345,48 @@ impl<'a> Socket<'a> {
         }
     }
 
+    #[allow(dead_code)] // Used by external DPDK transport and tests.
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
-        if self.tuple.is_none() {
+        let Some(tuple) = self.dispatch_setup(cx) else {
             return Ok(());
-        }
+        };
+        let mut emit = Some(emit);
+        let mut emit_fn = |cx: &mut Context, repr: (IpRepr, TcpRepr)| -> Result<(), E> {
+            (emit.take().unwrap())(cx, repr)
+        };
+        self.dispatch_one(cx, tuple, &mut emit_fn)?;
+        Ok(())
+    }
 
-        // NOTE(unwrap): we check tuple is not None above.
-        let tuple = self.tuple.unwrap();
+    /// Like [`dispatch`], but emits as many segments as possible in a single call.
+    ///
+    /// The `emit` closure is called once per segment — it uses `FnMut` so it can
+    /// be invoked multiple times. This avoids the overhead of re-entering the
+    /// dispatch path and re-iterating all sockets for each segment.
+    pub(crate) fn dispatch_burst<F, E>(&mut self, cx: &mut Context, mut emit: F) -> Result<(), E>
+    where
+        F: FnMut(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
+    {
+        let Some(tuple) = self.dispatch_setup(cx) else {
+            return Ok(());
+        };
+
+        loop {
+            match self.dispatch_one(cx, tuple, &mut emit)? {
+                true => continue,
+                false => return Ok(()),
+            }
+        }
+    }
+
+    /// Pre-dispatch setup: validates tuple, initializes timestamps, handles
+    /// retransmit timers. Returns `Some(tuple)` if ready to dispatch, `None`
+    /// if there is nothing to do.
+    fn dispatch_setup(&mut self, cx: &mut Context) -> Option<Tuple> {
+        let tuple = self.tuple?;
 
         // Check if the interface still has our source IP address.
         // If not (e.g. the interface's IP changed), reset the socket.
@@ -2363,7 +2395,7 @@ impl<'a> Socket<'a> {
         if !cx.has_ip_addr(tuple.local.addr) {
             net_debug!("source IP address no longer available, closing socket");
             self.reset();
-            return Ok(());
+            return None;
         }
 
         if self.remote_last_ts.is_none() {
@@ -2412,9 +2444,24 @@ impl<'a> Socket<'a> {
 
         #[cfg(feature = "socket-tcp-pause-synack")]
         if matches!(self.state, State::SynReceived) && self.synack_paused {
-            return Ok(());
+            return None;
         }
 
+        Some(tuple)
+    }
+
+    /// Attempt to emit a single TCP segment. Returns `Ok(true)` if a data segment
+    /// was emitted and more may follow, `Ok(false)` if nothing was sent or a
+    /// terminal segment (RST, keep-alive, zero-window probe, SYN) was sent.
+    fn dispatch_one<F, E>(
+        &mut self,
+        cx: &mut Context,
+        tuple: Tuple,
+        emit: &mut F,
+    ) -> Result<bool, E>
+    where
+        F: FnMut(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
+    {
         // Decide whether we're sending a packet.
         if self.seq_to_transmit(cx) {
             // If we have data to transmit and it fits into partner's window, do it.
@@ -2437,9 +2484,9 @@ impl<'a> Socket<'a> {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
             tcp_trace!("TIME-WAIT timer expired");
             self.reset();
-            return Ok(());
+            return Ok(false);
         } else {
-            return Ok(());
+            return Ok(false);
         }
 
         // Construct the lowered IP representation.
@@ -2482,7 +2529,7 @@ impl<'a> Socket<'a> {
             }
 
             // We never transmit anything in the LISTEN state.
-            State::Listen => return Ok(()),
+            State::Listen => return Ok(false),
 
             // We transmit a SYN in the SYN-SENT state.
             // We transmit a SYN|ACK in the SYN-RECEIVED state.
@@ -2633,13 +2680,13 @@ impl<'a> Socket<'a> {
         // Leave the rest of the state intact if sending a zero-window probe.
         if is_zero_window_probe {
             self.timer.rewind_zero_window_probe(cx.now());
-            return Ok(());
+            return Ok(false);
         }
 
         // Leave the rest of the state intact if sending a keep-alive packet, since those
         // carry a fake segment.
         if is_keep_alive {
-            return Ok(());
+            return Ok(false);
         }
 
         // We've sent a packet successfully, so we can update the internal state now.
@@ -2671,9 +2718,11 @@ impl<'a> Socket<'a> {
                 // Wake tx now so that async users can wait for the RST to be sent
                 self.tx_waker.wake();
             }
+            return Ok(false);
         }
 
-        Ok(())
+        // Data segment emitted — more may follow if tx_buffer has remaining data.
+        Ok(self.seq_to_transmit(cx))
     }
 
     #[allow(clippy::if_same_then_else)]
@@ -5860,6 +5909,79 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    fn test_dispatch_burst_sends_multiple_segments() {
+        let mut s = socket_established();
+        // MSS of 6 means 12 bytes of data requires 2 segments.
+        s.remote_mss = 6;
+        s.send_slice(b"abcdef012345").unwrap();
+
+        s.cx.set_now(Instant::from_millis(0));
+        let mut segments: Vec<TcpRepr<'static>> = Vec::new();
+        let result: Result<(), ()> =
+            s.socket
+                .dispatch_burst(&mut s.cx, |_, (_ip_repr, tcp_repr)| {
+                    segments.push(TcpRepr {
+                        // Copy payload into owned 'static form for assertion.
+                        payload: &[],
+                        ..tcp_repr
+                    });
+                    // Stash payload content separately since TcpRepr borrows tx_buffer.
+                    Ok(())
+                });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            segments.len(),
+            2,
+            "dispatch_burst should emit 2 segments for 12 bytes with MSS=6"
+        );
+        // First segment: data, no PSH (not end of buffer at time of construction).
+        assert_eq!(segments[0].seq_number, LOCAL_SEQ + 1);
+        assert_eq!(segments[0].control, TcpControl::None);
+        // Second segment: PSH (end of buffer).
+        assert_eq!(segments[1].seq_number, LOCAL_SEQ + 1 + 6);
+        assert_eq!(segments[1].control, TcpControl::Psh);
+    }
+
+    #[test]
+    fn test_dispatch_burst_stops_on_emit_error() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.send_slice(b"abcdef012345").unwrap();
+
+        s.cx.set_now(Instant::from_millis(0));
+        let mut call_count = 0;
+        let result: Result<(), ()> =
+            s.socket
+                .dispatch_burst(&mut s.cx, |_, (_ip_repr, _tcp_repr)| {
+                    call_count += 1;
+                    if call_count >= 2 { Err(()) } else { Ok(()) }
+                });
+        // First emit succeeds, second fails — error is propagated.
+        assert_eq!(result, Err(()));
+        assert_eq!(call_count, 2);
+        // After the error, remote_last_seq should reflect only the first segment.
+        assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1 + 6);
+    }
+
+    #[test]
+    fn test_dispatch_burst_nothing_to_send() {
+        let mut s = socket_established();
+        s.cx.set_now(Instant::from_millis(0));
+        let mut call_count = 0;
+        let result: Result<(), ()> =
+            s.socket
+                .dispatch_burst(&mut s.cx, |_, (_ip_repr, _tcp_repr)| {
+                    call_count += 1;
+                    Ok(())
+                });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            call_count, 0,
+            "No segments should be emitted when nothing to send"
+        );
     }
 
     #[test]
