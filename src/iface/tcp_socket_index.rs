@@ -11,6 +11,7 @@ const SEED: usize = 0x517cc1b727220a95;
 #[cfg(target_pointer_width = "32")]
 const SEED: usize = 0x9e3779b9;
 
+#[inline]
 fn hash_ip_addr(h: usize, addr: &IpAddress) -> usize {
     match addr {
         #[cfg(feature = "proto-ipv4")]
@@ -51,6 +52,7 @@ struct Key {
 
 impl Key {
     /// FxHash-style hash for fast, non-cryptographic hashing.
+    #[inline]
     fn hash(&self) -> usize {
         let mut h: usize = 0;
 
@@ -88,6 +90,7 @@ impl TcpSocketIndex {
     }
 
     /// Look up a socket handle by 4-tuple. Returns `None` if not indexed.
+    #[inline]
     pub(crate) fn get(
         &self,
         local_addr: IpAddress,

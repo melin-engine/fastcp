@@ -1554,6 +1554,7 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(ip_repr, repr))
     }
 
+    #[inline]
     pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
@@ -2760,6 +2761,7 @@ impl<'a> Socket<'a> {
     /// Pre-dispatch setup: validates tuple, initializes timestamps, handles
     /// retransmit timers. Returns `Some(tuple)` if ready to dispatch, `None`
     /// if there is nothing to do.
+    #[inline]
     fn dispatch_setup(&mut self, cx: &mut Context) -> Option<Tuple> {
         let tuple = self.tuple?;
 
