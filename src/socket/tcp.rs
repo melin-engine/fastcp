@@ -551,6 +551,40 @@ pub struct Socket<'a> {
 
 const DEFAULT_MSS: usize = 536;
 
+/// Accumulated state during batch processing of data segments.
+/// Collected per-segment, consumed once by [`Socket::process_batch_finalize()`].
+#[derive(Default)]
+struct BatchAccumulator {
+    /// Number of segments processed via the fast path.
+    segments_processed: usize,
+    /// Highest ACK number seen across all segments.
+    last_ack_number: Option<TcpSeqNumber>,
+    /// Total acknowledged bytes across all segments.
+    total_ack_len: usize,
+    /// Whether all outstanding data was acknowledged by any segment.
+    ack_all: bool,
+    /// Last segment's remote window length (scaled).
+    last_window_len: Option<usize>,
+    /// Whether the remote window changed from the pre-batch value.
+    is_window_update: bool,
+    /// Last segment's TCP timestamp value.
+    last_timestamp_tsval: Option<u32>,
+    /// Total payload bytes written to rx_buffer.
+    payload_bytes: usize,
+    /// Whether the assembler was empty before the first payload write.
+    assembler_was_empty_at_start: bool,
+}
+
+/// Result of processing a single data segment in the fast batch path.
+enum DataSegmentResult {
+    /// Segment processed successfully, continue with next.
+    Ok,
+    /// Segment triggered a reply (challenge ACK). Batch should stop.
+    Reply(Option<(IpRepr, TcpRepr<'static>)>),
+    /// Segment was dropped (unacceptable, assembler full). Continue.
+    Dropped,
+}
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -2215,11 +2249,15 @@ impl<'a> Socket<'a> {
 
     /// Process a batch of TCP segments destined for this socket.
     ///
-    /// Intermediate ACK replies are suppressed — only the final reply (if any) is
-    /// returned. This reduces ACK traffic when processing a burst of segments.
+    /// For data segments on an ESTABLISHED connection, per-segment overhead is
+    /// minimized: only ACK/window validation, payload write, and TX buffer
+    /// management run per-segment. RTT estimation, congestion control, timer
+    /// management, duplicate ACK detection, and ACK reply generation are
+    /// deferred and run once after all segments are processed.
+    ///
+    /// For control segments (RST, SYN, FIN) or non-ESTABLISHED states, falls
+    /// back to the regular [`process()`] path.
     #[allow(dead_code)] // Used by InterfaceInner::process_tcp_batch and tests.
-    /// The caller is responsible for finding the socket once and passing all
-    /// matching segments here.
     pub(crate) fn process_batch<'p>(
         &mut self,
         cx: &mut Context,
@@ -2234,24 +2272,320 @@ impl<'a> Socket<'a> {
             return self.process(cx, &segments[0].0, &segments[0].1);
         }
 
-        let mut last_reply = None;
-        for (ip_repr, tcp_repr) in segments {
-            let reply = self.process(cx, ip_repr, tcp_repr);
+        let mut batch = BatchAccumulator::default();
+        let mut last_ip_repr = None;
+        let mut last_tcp_repr = None;
 
-            // Keep the latest reply. For in-order data, process() returns None
-            // (ACK deferred). For out-of-order or control segments, we keep the
-            // last ACK/RST to send, which covers all previously received data.
-            if reply.is_some() {
-                last_reply = reply;
+        for (ip_repr, tcp_repr) in segments {
+            // Fast path: data segment on ESTABLISHED connection with no control flags.
+            if self.state == State::Established
+                && matches!(tcp_repr.control, TcpControl::None | TcpControl::Psh)
+            {
+                match self.process_data_segment(cx, ip_repr, tcp_repr, &mut batch) {
+                    DataSegmentResult::Ok => {
+                        last_ip_repr = Some(ip_repr);
+                        last_tcp_repr = Some(tcp_repr);
+                        continue;
+                    }
+                    DataSegmentResult::Reply(reply) => {
+                        // Challenge ACK or similar — finalize what we have and return.
+                        if batch.segments_processed > 0 {
+                            self.process_batch_finalize(
+                                cx,
+                                &batch,
+                                last_ip_repr.unwrap(),
+                                last_tcp_repr.unwrap(),
+                            );
+                        }
+                        return reply;
+                    }
+                    DataSegmentResult::Dropped => continue,
+                }
             }
 
-            // If a RST or FIN closed the socket, stop processing further segments.
+            // Slow path: control segment or non-ESTABLISHED state.
+            // Finalize any accumulated batch state first.
+            if batch.segments_processed > 0 {
+                self.process_batch_finalize(
+                    cx,
+                    &batch,
+                    last_ip_repr.unwrap(),
+                    last_tcp_repr.unwrap(),
+                );
+                batch = BatchAccumulator::default();
+                last_ip_repr = None;
+                last_tcp_repr = None;
+            }
+
+            // Fall back to regular per-segment process.
+            let reply = self.process(cx, ip_repr, tcp_repr);
             if self.state == State::Closed || self.state == State::TimeWait {
-                break;
+                return reply;
+            }
+            // Discard intermediate replies (only the final batch ACK matters).
+        }
+
+        // Finalize the batch.
+        if batch.segments_processed > 0 {
+            self.process_batch_finalize(cx, &batch, last_ip_repr.unwrap(), last_tcp_repr.unwrap());
+
+            // Generate a single ACK reply if we have data to acknowledge.
+            if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
+                let ip = last_ip_repr.unwrap();
+                let tcp = last_tcp_repr.unwrap();
+                return Some(self.ack_reply(ip, tcp));
             }
         }
 
-        last_reply
+        None
+    }
+
+    /// Process the per-segment work for a data segment on an ESTABLISHED
+    /// connection. Performs ACK/window validation, payload write, and TX buffer
+    /// management. Deferred work (RTT, congestion, timers) is accumulated in
+    /// `batch` for later finalization.
+    fn process_data_segment(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+        batch: &mut BatchAccumulator,
+    ) -> DataSegmentResult {
+        debug_assert!(self.state == State::Established);
+
+        // --- ACK validation (simplified for ESTABLISHED) ---
+        if let Some(ack_number) = repr.ack_number {
+            let unacknowledged = self.tx_buffer.len();
+            let ack_min = self.local_seq_no;
+            let ack_max = self.local_seq_no + unacknowledged;
+
+            if ack_number < ack_min {
+                // Duplicate ACK below window — not an error, just skip.
+                // (Will be handled by dup ACK detection in finalize.)
+            } else if ack_number > ack_max {
+                return DataSegmentResult::Reply(self.challenge_ack_reply(cx, ip_repr, repr));
+            }
+        } else {
+            // Every packet after the initial SYN must be an acknowledgement.
+            return DataSegmentResult::Dropped;
+        }
+
+        // --- Window/sequence validation ---
+        let window_start = self.remote_seq_no + self.rx_buffer.len();
+        let window_end = if let Some(last_ack) = self.remote_last_ack {
+            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+        } else {
+            window_start
+        };
+        let segment_start = repr.seq_number;
+        let segment_end = repr.seq_number + repr.payload.len();
+
+        let (payload, payload_offset) = {
+            let segment_in_window = match (segment_start == segment_end, window_start == window_end)
+            {
+                (true, _) if segment_end == window_start - 1 => false,
+                (true, true) => window_start == segment_start,
+                (true, false) => window_start <= segment_start && segment_start < window_end,
+                (false, true) => false,
+                (false, false) => {
+                    (window_start <= segment_start && segment_start < window_end)
+                        || (window_start < segment_end && segment_end <= window_end)
+                }
+            };
+
+            if segment_in_window {
+                let overlap_start = window_start.max(segment_start);
+                let overlap_end = window_end.min(segment_end);
+                debug_assert!(overlap_start <= overlap_end);
+                self.local_rx_last_seq = Some(repr.seq_number);
+                (
+                    &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
+                    overlap_start - window_start,
+                )
+            } else {
+                return DataSegmentResult::Reply(self.challenge_ack_reply(cx, ip_repr, repr));
+            }
+        };
+
+        // --- ACK len computation (without RTT/congestion calls) ---
+        let mut ack_len = 0;
+        let mut ack_all = false;
+        if let Some(ack_number) = repr.ack_number {
+            let tx_buffer_start_seq = self.local_seq_no;
+            if ack_number >= tx_buffer_start_seq {
+                ack_len = ack_number - tx_buffer_start_seq;
+                ack_all = self.remote_last_seq <= ack_number;
+            }
+
+            // Accumulate for batch finalize.
+            batch.last_ack_number = Some(ack_number);
+            batch.total_ack_len += ack_len;
+            if ack_all {
+                batch.ack_all = true;
+            }
+
+            // TX buffer dequeue (must be per-segment).
+            if ack_len > 0 {
+                debug_assert!(self.tx_buffer.len() >= ack_len);
+                self.tx_buffer.dequeue_allocated(ack_len);
+                #[cfg(feature = "async")]
+                self.tx_waker.wake();
+            }
+
+            // Advance local_seq_no (must be per-segment for next ack_len computation).
+            self.local_seq_no = ack_number;
+            if self.remote_last_seq < self.local_seq_no {
+                self.remote_last_seq = self.local_seq_no;
+            }
+        }
+
+        // --- Window update (accumulate for finalize) ---
+        let scale = self.remote_win_scale.unwrap_or(0);
+        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        batch.last_window_len = Some(new_remote_win_len);
+        batch.is_window_update =
+            batch.is_window_update || new_remote_win_len != self.remote_win_len;
+
+        // --- Timestamp (accumulate for finalize) ---
+        if let Some(timestamp) = repr.timestamp {
+            batch.last_timestamp_tsval = Some(timestamp.tsval);
+        }
+
+        // --- Payload write ---
+        if batch.segments_processed == 0 {
+            batch.assembler_was_empty_at_start = self.assembler.is_empty();
+        }
+
+        let payload_len = payload.len();
+        if payload_len > 0 {
+            let Ok(contig_len) = self
+                .assembler
+                .add_then_remove_front(payload_offset, payload_len)
+            else {
+                return DataSegmentResult::Dropped;
+            };
+
+            let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
+            debug_assert!(len_written == payload_len);
+
+            if contig_len != 0 {
+                self.rx_buffer.enqueue_unallocated(contig_len);
+                #[cfg(feature = "async")]
+                self.rx_waker.wake();
+            }
+
+            batch.payload_bytes += payload_len;
+        }
+
+        batch.segments_processed += 1;
+        DataSegmentResult::Ok
+    }
+
+    /// Run the deferred bookkeeping after processing a batch of data segments.
+    /// This covers RTT estimation, congestion control, timer management,
+    /// duplicate ACK detection, and delayed ACK handling.
+    fn process_batch_finalize(
+        &mut self,
+        cx: &mut Context,
+        batch: &BatchAccumulator,
+        _last_ip_repr: &IpRepr,
+        last_repr: &TcpRepr,
+    ) {
+        // RTT estimation + congestion control — once with final values.
+        if let Some(ack_number) = batch.last_ack_number {
+            self.rtte.on_ack(cx.now(), ack_number);
+            self.congestion_controller.inner_mut().on_ack(
+                cx.now(),
+                batch.total_ack_len,
+                &self.rtte,
+            );
+        }
+
+        // Remote timestamp.
+        self.remote_last_ts = Some(cx.now());
+
+        // Window update.
+        if let Some(new_remote_win_len) = batch.last_window_len {
+            self.remote_win_len = new_remote_win_len;
+            self.congestion_controller
+                .inner_mut()
+                .set_remote_window(new_remote_win_len);
+        }
+
+        // Duplicate ACK detection — only the last segment matters.
+        if let Some(ack_number) = batch.last_ack_number {
+            let is_window_update = batch.is_window_update;
+            match self.local_rx_last_ack {
+                Some(last_rx_ack)
+                    if last_repr.payload.is_empty()
+                        && last_rx_ack == ack_number
+                        && ack_number < self.remote_last_seq
+                        && !is_window_update =>
+                {
+                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_duplicate_ack(cx.now());
+                    if self.local_rx_dup_acks == 3 {
+                        self.timer.set_for_fast_retransmit();
+                    }
+                }
+                _ => {
+                    if self.local_rx_dup_acks > 0 {
+                        self.local_rx_dup_acks = 0;
+                    }
+                    self.local_rx_last_ack = Some(ack_number);
+                }
+            }
+        }
+
+        // Timestamp option.
+        if let Some(tsval) = batch.last_timestamp_tsval {
+            self.last_remote_tsval = tsval;
+        }
+
+        // Timer updates — once.
+        match self.timer {
+            Timer::Retransmit { .. } | Timer::FastRetransmit => {
+                if batch.ack_all {
+                    self.timer.set_for_idle(cx.now(), self.keep_alive);
+                } else if batch.total_ack_len > 0 {
+                    let rto = self.rtte.retransmission_timeout();
+                    self.timer.set_for_retransmit(cx.now(), rto);
+                }
+            }
+            Timer::Idle { .. } => {
+                self.timer.set_for_idle(cx.now(), self.keep_alive);
+            }
+            _ => {}
+        }
+
+        // Zero-window probe timer.
+        if self.remote_win_len == 0
+            && !self.tx_buffer.is_empty()
+            && (self.timer.is_idle() || batch.total_ack_len > 0)
+        {
+            let delay = self.rtte.retransmission_timeout();
+            self.timer.set_for_zero_window_probe(cx.now(), delay);
+        }
+        if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
+            self.timer.set_for_idle(cx.now(), self.keep_alive);
+        }
+
+        // Delayed ACK handling.
+        if batch.payload_bytes > 0
+            && let Some(ack_delay) = self.ack_delay
+            && self.ack_to_transmit()
+        {
+            self.ack_delay_timer = match self.ack_delay_timer {
+                AckDelayTimer::Idle => AckDelayTimer::Waiting(cx.now() + ack_delay),
+                AckDelayTimer::Waiting(_) if self.immediate_ack_to_transmit() => {
+                    AckDelayTimer::Immediate
+                }
+                timer @ AckDelayTimer::Waiting(_) => timer,
+                AckDelayTimer::Immediate => AckDelayTimer::Immediate,
+            };
+        }
     }
 
     fn timed_out(&self, timestamp: Instant) -> bool {
@@ -6131,6 +6465,133 @@ mod test {
             s.socket.recv_slice(&mut [0u8; 3]),
             Err(RecvError::InvalidState)
         );
+    }
+
+    /// Differential test: verify that the batched fast path produces the same
+    /// socket state as processing each segment individually through process().
+    #[test]
+    fn test_process_batch_differential_vs_sequential() {
+        // Set up two identical sockets.
+        let mut s_batch = socket_established();
+        let mut s_seq = socket_established();
+        s_batch.cx.set_now(Instant::from_millis(0));
+        s_seq.cx.set_now(Instant::from_millis(0));
+
+        // Queue some TX data so we can observe ACK processing.
+        s_batch.send_slice(b"outgoing data here").unwrap();
+        s_seq.send_slice(b"outgoing data here").unwrap();
+
+        // Drain the TX data by dispatching (so remote_last_seq advances).
+        s_batch.cx.set_now(Instant::from_millis(0));
+        let _ = s_batch
+            .socket
+            .dispatch(&mut s_batch.cx, |_, _| Ok::<(), ()>(()));
+        s_seq.cx.set_now(Instant::from_millis(0));
+        let _ = s_seq
+            .socket
+            .dispatch(&mut s_seq.cx, |_, _| Ok::<(), ()>(()));
+
+        let ip_repr = RECV_IP_TEMPL;
+
+        // 4 contiguous data segments acknowledging our TX data.
+        let segments: Vec<(IpRepr, TcpRepr)> = (0..4)
+            .map(|i| {
+                let payload: &'static [u8] = match i {
+                    0 => b"aaa",
+                    1 => b"bbb",
+                    2 => b"ccc",
+                    3 => b"ddd",
+                    _ => unreachable!(),
+                };
+                (
+                    ip_repr.clone(),
+                    TcpRepr {
+                        seq_number: REMOTE_SEQ + 1 + (i * 3),
+                        ack_number: Some(LOCAL_SEQ + 1 + 18), // ACK our 18 bytes
+                        payload,
+                        ..SEND_TEMPL
+                    },
+                )
+            })
+            .collect();
+
+        // Process via batch (fast path).
+        let _batch_reply = s_batch.socket.process_batch(&mut s_batch.cx, &segments);
+
+        // Process sequentially.
+        for (ip, tcp) in &segments {
+            let _ = s_seq.socket.process(&mut s_seq.cx, ip, tcp);
+        }
+
+        // Compare socket state.
+        assert_eq!(
+            s_batch.local_seq_no, s_seq.local_seq_no,
+            "local_seq_no mismatch"
+        );
+        assert_eq!(
+            s_batch.remote_seq_no, s_seq.remote_seq_no,
+            "remote_seq_no mismatch"
+        );
+        assert_eq!(
+            s_batch.remote_last_seq, s_seq.remote_last_seq,
+            "remote_last_seq mismatch"
+        );
+        assert_eq!(
+            s_batch.remote_win_len, s_seq.remote_win_len,
+            "remote_win_len mismatch"
+        );
+        assert_eq!(
+            s_batch.tx_buffer.len(),
+            s_seq.tx_buffer.len(),
+            "tx_buffer mismatch"
+        );
+
+        // Compare RX buffer contents.
+        let mut buf_batch = [0u8; 12];
+        let mut buf_seq = [0u8; 12];
+        let n_batch = s_batch.socket.recv_slice(&mut buf_batch).unwrap();
+        let n_seq = s_seq.socket.recv_slice(&mut buf_seq).unwrap();
+        assert_eq!(n_batch, n_seq, "rx_buffer length mismatch");
+        assert_eq!(
+            &buf_batch[..n_batch],
+            &buf_seq[..n_seq],
+            "rx_buffer content mismatch"
+        );
+    }
+
+    #[test]
+    fn test_process_batch_fast_path_many_segments() {
+        let mut s = socket_established();
+        s.cx.set_now(Instant::from_millis(0));
+
+        let ip_repr = RECV_IP_TEMPL;
+
+        // 16 contiguous data segments.
+        let segments: Vec<(IpRepr, TcpRepr)> = (0..16)
+            .map(|i| {
+                (
+                    ip_repr.clone(),
+                    TcpRepr {
+                        seq_number: REMOTE_SEQ + 1 + (i * 4),
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        payload: b"data",
+                        ..SEND_TEMPL
+                    },
+                )
+            })
+            .collect();
+
+        let reply = s.socket.process_batch(&mut s.cx, &segments);
+
+        // Should produce no intermediate ACKs — all in-order data.
+        // The delayed ACK timer should handle it.
+        assert!(reply.is_none(), "in-order batch should defer ACK");
+
+        // All 64 bytes should be received.
+        let mut buf = [0u8; 64];
+        let n = s.socket.recv_slice(&mut buf).unwrap();
+        assert_eq!(n, 64);
+        assert!(buf.iter().all(|&b| b != 0), "all bytes should be filled");
     }
 
     #[test]
