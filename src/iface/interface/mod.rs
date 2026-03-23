@@ -155,6 +155,12 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
+
+    /// One-element cache for hardware address resolution. Avoids repeated
+    /// route() + neighbor_cache.lookup() calls within dispatch_burst() where
+    /// all segments go to the same destination.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    cached_hardware_addr: Option<(IpAddress, HardwareAddress)>,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -284,6 +290,8 @@ impl Interface {
                 slaac: Slaac::new(),
                 #[cfg(feature = "proto-ipv6-slaac")]
                 slaac_updated: Instant::from_millis(0),
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+                cached_hardware_addr: None,
                 rand,
             },
         }
@@ -1152,6 +1160,15 @@ impl InterfaceInner {
     where
         Tx: TxToken,
     {
+        // Fast path: check the one-element cache. This avoids route() +
+        // neighbor_cache.lookup() for consecutive packets to the same
+        // destination (common in dispatch_burst).
+        if let Some((cached_ip, cached_hw)) = &self.cached_hardware_addr
+            && cached_ip == dst_addr
+        {
+            return Ok((*cached_hw, tx_token));
+        }
+
         if self.is_broadcast(dst_addr) {
             let hardware_addr = match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
@@ -1208,12 +1225,16 @@ impl InterfaceInner {
             return Ok((hardware_addr, tx_token));
         }
 
+        let original_dst = *dst_addr;
         let dst_addr = self
             .route(dst_addr, self.now)
             .ok_or(DispatchError::NoRoute)?;
 
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
-            NeighborAnswer::Found(hardware_addr) => return Ok((hardware_addr, tx_token)),
+            NeighborAnswer::Found(hardware_addr) => {
+                self.cached_hardware_addr = Some((original_dst, hardware_addr));
+                return Ok((hardware_addr, tx_token));
+            }
             NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
             _ => (), // XXX
         }
@@ -1292,7 +1313,10 @@ impl InterfaceInner {
 
     fn flush_neighbor_cache(&mut self) {
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        self.neighbor_cache.flush()
+        {
+            self.neighbor_cache.flush();
+            self.cached_hardware_addr = None;
+        }
     }
 
     fn dispatch_ip<Tx: TxToken>(
