@@ -15,6 +15,8 @@ mod rpl;
 mod slaac;
 mod socket_meta;
 mod socket_set;
+#[cfg(feature = "socket-tcp")]
+mod tcp_socket_index;
 
 mod packet;
 

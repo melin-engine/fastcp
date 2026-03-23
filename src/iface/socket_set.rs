@@ -117,6 +117,19 @@ impl<'a> SocketSet<'a> {
         }
     }
 
+    /// Get a mutable reference to the raw socket enum by its handle.
+    ///
+    /// Unlike [`get_mut`], this does not downcast to a specific socket type.
+    ///
+    /// # Panics
+    /// This function may panic if the handle does not belong to this socket set.
+    pub(crate) fn get_socket_mut(&mut self, handle: SocketHandle) -> &mut Socket<'a> {
+        match self.sockets[handle.0].inner.as_mut() {
+            Some(item) => &mut item.socket,
+            None => panic!("handle does not refer to a valid socket"),
+        }
+    }
+
     /// Remove a socket from the set, without changing its state.
     ///
     /// # Panics

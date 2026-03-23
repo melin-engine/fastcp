@@ -155,6 +155,17 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
+
+    /// One-element cache for hardware address resolution. Avoids repeated
+    /// route() + neighbor_cache.lookup() calls within dispatch_burst() where
+    /// all segments go to the same destination.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    cached_hardware_addr: Option<(IpAddress, HardwareAddress)>,
+
+    /// O(1) lookup index for established TCP connections.
+    /// Maps 4-tuple → SocketHandle, avoiding the O(N) socket scan per packet.
+    #[cfg(feature = "socket-tcp")]
+    tcp_socket_index: super::tcp_socket_index::TcpSocketIndex,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -284,6 +295,10 @@ impl Interface {
                 slaac: Slaac::new(),
                 #[cfg(feature = "proto-ipv6-slaac")]
                 slaac_updated: Instant::from_millis(0),
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+                cached_hardware_addr: None,
+                #[cfg(feature = "socket-tcp")]
+                tcp_socket_index: super::tcp_socket_index::TcpSocketIndex::new(),
                 rand,
             },
         }
@@ -556,6 +571,109 @@ impl Interface {
         self.socket_ingress(device, sockets)
     }
 
+    /// Process a batch of pre-received raw frames.
+    ///
+    /// This is an alternative to [`poll_ingress_single()`](Self::poll_ingress_single)
+    /// for devices that perform burst I/O externally (e.g. DPDK `rx_burst`).
+    /// The caller receives a batch of frames from the device and passes them
+    /// here for protocol processing.
+    ///
+    /// Returns a value indicating whether the state of any socket might have changed.
+    ///
+    /// A `device` reference is still required to acquire transmit tokens for
+    /// reply packets (ACKs, RSTs, etc.).
+    pub fn poll_ingress_batch(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        frames: &[&[u8]],
+    ) -> PollResult {
+        self.inner.now = timestamp;
+
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragments.assembler.remove_expired(timestamp);
+
+        let mut result = PollResult::None;
+
+        for frame in frames {
+            if frame.is_empty() {
+                continue;
+            }
+
+            if self.process_ingress_frame(device, sockets, frame) {
+                result = PollResult::SocketStateChanged;
+            }
+        }
+
+        result
+    }
+
+    /// Process a single pre-received frame, dispatching any reply via `device.transmit()`.
+    /// Returns `true` if socket state may have changed.
+    fn process_ingress_frame(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        frame: &[u8],
+    ) -> bool {
+        match self.inner.caps.medium {
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => {
+                if let Some(packet) = self.inner.process_ethernet(
+                    sockets,
+                    PacketMeta::default(),
+                    frame,
+                    &mut self.fragments,
+                ) && let Some(tx_token) = device.transmit(self.inner.now)
+                    && let Err(err) = self.inner.dispatch(tx_token, packet, &mut self.fragmenter)
+                {
+                    net_debug!("Failed to send response: {:?}", err);
+                }
+            }
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => {
+                if let Some(packet) = self.inner.process_ip(
+                    sockets,
+                    PacketMeta::default(),
+                    frame,
+                    &mut self.fragments,
+                ) && let Some(tx_token) = device.transmit(self.inner.now)
+                    && let Err(err) = self.inner.dispatch_ip(
+                        tx_token,
+                        PacketMeta::default(),
+                        packet,
+                        &mut self.fragmenter,
+                    )
+                {
+                    net_debug!("Failed to send response: {:?}", err);
+                }
+            }
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                if let Some(packet) = self.inner.process_ieee802154(
+                    sockets,
+                    PacketMeta::default(),
+                    frame,
+                    &mut self.fragments,
+                ) && let Some(tx_token) = device.transmit(self.inner.now)
+                    && let Err(err) = self.inner.dispatch_ip(
+                        tx_token,
+                        PacketMeta::default(),
+                        packet,
+                        &mut self.fragmenter,
+                    )
+                {
+                    net_debug!("Failed to send response: {:?}", err);
+                }
+            }
+        }
+        // Like socket_ingress(), assume any non-empty frame may have changed socket state.
+        // The frame was processed by the medium-specific handler regardless of whether
+        // a response was generated.
+        true
+    }
+
     /// Maintain stateful processing on the device.
     ///
     /// This is guaranteed to always perform a bounded amount of work.
@@ -718,6 +836,12 @@ impl Interface {
                 continue;
             }
 
+            // Fast skip: if the socket reports it only needs ingress, skip the
+            // full dispatch setup. This avoids ~25ns per idle socket.
+            if item.socket.poll_at(&mut self.inner) == PollAt::Ingress {
+                continue;
+            }
+
             let mut neighbor_addr = None;
             let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
@@ -770,13 +894,15 @@ impl Interface {
                     })
                 }
                 #[cfg(feature = "socket-tcp")]
-                Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
-                    respond(
-                        inner,
-                        PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Tcp(tcp)),
-                    )
-                }),
+                Socket::Tcp(socket) => {
+                    socket.dispatch_burst(&mut self.inner, |inner, (ip, tcp)| {
+                        respond(
+                            inner,
+                            PacketMeta::default(),
+                            Packet::new(ip, IpPayload::Tcp(tcp)),
+                        )
+                    })
+                }
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => {
                     socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
@@ -1047,6 +1173,15 @@ impl InterfaceInner {
     where
         Tx: TxToken,
     {
+        // Fast path: check the one-element cache. This avoids route() +
+        // neighbor_cache.lookup() for consecutive packets to the same
+        // destination (common in dispatch_burst).
+        if let Some((cached_ip, cached_hw)) = &self.cached_hardware_addr
+            && cached_ip == dst_addr
+        {
+            return Ok((*cached_hw, tx_token));
+        }
+
         if self.is_broadcast(dst_addr) {
             let hardware_addr = match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
@@ -1103,12 +1238,16 @@ impl InterfaceInner {
             return Ok((hardware_addr, tx_token));
         }
 
+        let original_dst = *dst_addr;
         let dst_addr = self
             .route(dst_addr, self.now)
             .ok_or(DispatchError::NoRoute)?;
 
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
-            NeighborAnswer::Found(hardware_addr) => return Ok((hardware_addr, tx_token)),
+            NeighborAnswer::Found(hardware_addr) => {
+                self.cached_hardware_addr = Some((original_dst, hardware_addr));
+                return Ok((hardware_addr, tx_token));
+            }
             NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
             _ => (), // XXX
         }
@@ -1187,7 +1326,10 @@ impl InterfaceInner {
 
     fn flush_neighbor_cache(&mut self) {
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        self.neighbor_cache.flush()
+        {
+            self.neighbor_cache.flush();
+            self.cached_hardware_addr = None;
+        }
     }
 
     fn dispatch_ip<Tx: TxToken>(
