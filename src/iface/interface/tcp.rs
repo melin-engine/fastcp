@@ -19,14 +19,48 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
-        {
+        // Fast path: O(1) index lookup for established connections.
+        if let Some(handle) = self.tcp_socket_index.get(
+            ip_repr.dst_addr(),
+            tcp_repr.dst_port,
+            ip_repr.src_addr(),
+            tcp_repr.src_port,
+        ) {
+            let tcp_socket: &mut Socket = sockets.get_mut(handle);
             if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
                 return tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+            }
+            // Index stale — remove and fall through to linear scan.
+            self.tcp_socket_index.remove_by_handle(handle);
+        }
+
+        // Slow path: linear scan for LISTEN sockets and unindexed connections.
+        for item in sockets.items_mut() {
+            let handle = item.meta.handle;
+            let Some(tcp_socket) = Socket::downcast_mut(&mut item.socket) else {
+                continue;
+            };
+            if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                let result = tcp_socket
+                    .process(self, &ip_repr, &tcp_repr)
+                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+
+                // Index this connection for future O(1) lookups.
+                if let (Some(local), Some(remote)) =
+                    (tcp_socket.local_endpoint(), tcp_socket.remote_endpoint())
+                {
+                    self.tcp_socket_index.insert(
+                        local.addr,
+                        local.port,
+                        remote.addr,
+                        remote.port,
+                        handle,
+                    );
+                }
+
+                return result;
             }
         }
 

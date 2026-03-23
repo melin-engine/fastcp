@@ -161,6 +161,11 @@ pub struct InterfaceInner {
     /// all segments go to the same destination.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     cached_hardware_addr: Option<(IpAddress, HardwareAddress)>,
+
+    /// O(1) lookup index for established TCP connections.
+    /// Maps 4-tuple → SocketHandle, avoiding the O(N) socket scan per packet.
+    #[cfg(feature = "socket-tcp")]
+    tcp_socket_index: super::tcp_socket_index::TcpSocketIndex,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -292,6 +297,8 @@ impl Interface {
                 slaac_updated: Instant::from_millis(0),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 cached_hardware_addr: None,
+                #[cfg(feature = "socket-tcp")]
+                tcp_socket_index: super::tcp_socket_index::TcpSocketIndex::new(),
                 rand,
             },
         }
