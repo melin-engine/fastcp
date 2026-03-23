@@ -26,8 +26,11 @@ impl InterfaceInner {
             ip_repr.src_addr(),
             tcp_repr.src_port,
         ) {
-            let tcp_socket: &mut Socket = sockets.get_mut(handle);
-            if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+            // Guard against handle reuse: the slot may now hold a non-TCP socket
+            // if the original was removed and the handle recycled.
+            if let Some(tcp_socket) = Socket::downcast_mut(sockets.get_socket_mut(handle))
+                && tcp_socket.accepts(self, &ip_repr, &tcp_repr)
+            {
                 return tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));

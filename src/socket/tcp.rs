@@ -2361,8 +2361,9 @@ impl<'a> Socket<'a> {
             let ack_max = self.local_seq_no + unacknowledged;
 
             if ack_number < ack_min {
-                // Duplicate ACK below window — not an error, just skip.
-                // (Will be handled by dup ACK detection in finalize.)
+                // Duplicate ACK below window — drop the entire segment,
+                // matching the behavior of process() which returns None.
+                return DataSegmentResult::Dropped;
             } else if ack_number > ack_max {
                 return DataSegmentResult::Reply(self.challenge_ack_reply(cx, ip_repr, repr));
             }

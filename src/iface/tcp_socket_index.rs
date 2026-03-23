@@ -54,10 +54,8 @@ impl Key {
     /// FxHash-style hash for fast, non-cryptographic hashing.
     #[inline]
     fn hash(&self) -> usize {
-        let mut h: usize = 0;
-
-        // Hash the ports (most discriminating for same-subnet connections).
-        h = h.wrapping_mul(SEED) ^ (self.local_port as usize);
+        // Seed with the first port, then chain multiply-XOR.
+        let mut h: usize = self.local_port as usize;
         h = h.wrapping_mul(SEED) ^ (self.remote_port as usize);
 
         // Hash the addresses.
@@ -126,11 +124,6 @@ impl TcpSocketIndex {
         remote_port: u16,
         handle: SocketHandle,
     ) -> bool {
-        if self.len >= CAPACITY / 2 {
-            // Keep load factor below 50% for performance.
-            return false;
-        }
-
         let key = Key {
             local_addr,
             local_port,
@@ -143,12 +136,16 @@ impl TcpSocketIndex {
         for _ in 0..CAPACITY {
             match &self.slots[idx] {
                 Slot::Empty => {
+                    if self.len >= CAPACITY / 2 {
+                        // Keep load factor below 50% for performance.
+                        return false;
+                    }
                     self.slots[idx] = Slot::Occupied(key, handle);
                     self.len += 1;
                     return true;
                 }
                 Slot::Occupied(k, _) if *k == key => {
-                    // Update existing entry.
+                    // Update existing entry (no length change).
                     self.slots[idx] = Slot::Occupied(key, handle);
                     return true;
                 }
