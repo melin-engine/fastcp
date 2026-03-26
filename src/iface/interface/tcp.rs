@@ -134,8 +134,8 @@ impl InterfaceInner {
     /// frame memory alive until the application consumes data via
     /// [`Socket::recv_zero_copy()`].
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
-    #[allow(dead_code, private_interfaces)]
-    pub fn process_tcp_batch_zero_copy<'frame>(
+    #[allow(dead_code)]
+    pub(crate) fn process_tcp_batch_zero_copy<'frame>(
         &mut self,
         sockets: &mut SocketSet,
         handled_by_raw_socket: bool,

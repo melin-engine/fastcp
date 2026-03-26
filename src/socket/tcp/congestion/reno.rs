@@ -55,10 +55,6 @@ impl Controller for Reno {
         self.min_cwnd = mss;
     }
 
-    fn set_initial_window(&mut self, cwnd: usize) {
-        self.cwnd = cwnd;
-    }
-
     fn set_remote_window(&mut self, remote_window: usize) {
         if self.rwnd < remote_window {
             self.rwnd = remote_window;

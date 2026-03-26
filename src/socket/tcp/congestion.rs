@@ -30,9 +30,6 @@ pub(super) trait Controller {
 
     /// Set the maximum segment size.
     fn set_mss(&mut self, mss: usize) {}
-
-    /// Set the initial congestion window size in bytes.
-    fn set_initial_window(&mut self, _cwnd: usize) {}
 }
 
 #[derive(Debug)]

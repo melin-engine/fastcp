@@ -107,11 +107,6 @@ impl Controller for Cubic {
     fn set_mss(&mut self, mss: usize) {
         self.min_cwnd = mss;
     }
-
-    fn set_initial_window(&mut self, cwnd: usize) {
-        self.cwnd = cwnd;
-        self.w_max = cwnd;
-    }
 }
 
 #[inline]
