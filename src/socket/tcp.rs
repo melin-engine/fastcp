@@ -104,6 +104,66 @@ impl std::error::Error for RecvError {}
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 
+/// Opaque handle representing a borrowed frame for zero-copy RX.
+///
+/// 16 bytes: large enough to hold a pointer (8 bytes on 64-bit) plus
+/// pool metadata. The caller (e.g. DPDK transport) packs its native
+/// mbuf pointer into this and provides a [`FrameReleaseFn`] to free it.
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+#[derive(Debug, Clone, Copy)]
+pub struct OpaqueFrameHandle {
+    bytes: [u8; 16],
+}
+
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+impl OpaqueFrameHandle {
+    /// Create a handle from raw bytes.
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self { bytes }
+    }
+
+    /// Access the raw bytes (e.g. to extract a pointer).
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.bytes
+    }
+}
+
+/// Function pointer type for releasing a borrowed frame.
+/// Called when the application has consumed the segment data via
+/// [`Socket::recv_zero_copy`], or when the socket is reset/aborted.
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+pub type FrameReleaseFn = fn(OpaqueFrameHandle);
+
+/// Descriptor for a segment whose payload lives in externally-owned
+/// frame memory (e.g. a DPDK mbuf in hugepage memory).
+///
+/// Stored in a fixed-capacity array on the socket. The `data_ptr` is
+/// valid as long as the `frame_handle` has not been released.
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+#[derive(Debug, Clone, Copy)]
+struct ZeroCopySegment {
+    /// Pointer to the start of payload data in frame memory.
+    data_ptr: *const u8,
+    /// Length of the payload data in bytes.
+    data_len: usize,
+    /// Byte offset from the receive window start (assembler semantics).
+    stream_offset: usize,
+    /// Opaque handle for releasing the backing frame.
+    frame_handle: OpaqueFrameHandle,
+}
+
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+impl Default for ZeroCopySegment {
+    fn default() -> Self {
+        Self {
+            data_ptr: core::ptr::null(),
+            data_len: 0,
+            stream_offset: 0,
+            frame_handle: OpaqueFrameHandle { bytes: [0; 16] },
+        }
+    }
+}
+
 /// The state of a TCP socket, according to [RFC 793].
 ///
 /// [RFC 793]: https://tools.ietf.org/html/rfc793
@@ -547,6 +607,23 @@ pub struct Socket<'a> {
     /// If this is set, we will not send a SYN|ACK until this is unset.
     #[cfg(feature = "socket-tcp-pause-synack")]
     synack_paused: bool,
+
+    /// Fixed-capacity array of zero-copy segment descriptors, sorted by stream_offset.
+    /// Each entry points into externally-owned frame memory (e.g. DPDK mbufs).
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_segments: [ZeroCopySegment; crate::config::ZERO_COPY_RX_MAX_SEGMENTS],
+    /// Number of valid entries in `zc_segments`.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_segment_count: usize,
+    /// Total contiguous bytes at the front of `zc_segments`, ready for the application.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_contiguous_bytes: usize,
+    /// Total bytes held across all zero-copy segments (for window accounting).
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_held_bytes: usize,
+    /// Callback for releasing frames when segments are consumed or the socket is reset.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_release_fn: Option<FrameReleaseFn>,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -647,6 +724,17 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-pause-synack")]
             synack_paused: false,
+
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_segments: [ZeroCopySegment::default(); crate::config::ZERO_COPY_RX_MAX_SEGMENTS],
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_segment_count: 0,
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_contiguous_bytes: 0,
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_held_bytes: 0,
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_release_fn: None,
         }
     }
 
@@ -775,12 +863,51 @@ impl<'a> Socket<'a> {
         self.synack_paused = pause;
     }
 
+    /// Register the callback used to release borrowed frames when zero-copy
+    /// segments are consumed via [`recv_zero_copy`] or when the socket is reset.
+    ///
+    /// Must be called before [`process_batch_zero_copy`] or [`process_zero_copy`].
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    pub fn set_zero_copy_release_fn(&mut self, f: FrameReleaseFn) {
+        self.zc_release_fn = Some(f);
+    }
+
+    /// Release all held zero-copy segments, calling the release function for each.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    fn release_all_zero_copy_segments(&mut self) {
+        if let Some(release_fn) = self.zc_release_fn {
+            for i in 0..self.zc_segment_count {
+                release_fn(self.zc_segments[i].frame_handle);
+            }
+        }
+        self.zc_segment_count = 0;
+        self.zc_contiguous_bytes = 0;
+        self.zc_held_bytes = 0;
+    }
+
+    /// Contiguous bytes held in zero-copy segments, equivalent to
+    /// `rx_buffer.len()` for the zero-copy path. Only contiguous (front)
+    /// bytes affect window start, ACK numbers, and advertised window.
+    /// Returns 0 when the feature is disabled.
+    #[inline]
+    fn zc_held(&self) -> usize {
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            self.zc_contiguous_bytes
+        }
+        #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
+        {
+            0
+        }
+    }
+
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        let window = self.rx_buffer.window().saturating_sub(self.zc_held());
+        u16::try_from(window >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -794,7 +921,7 @@ impl<'a> Socket<'a> {
     #[inline]
     fn last_scaled_window(&self) -> Option<u16> {
         let last_ack = self.remote_last_ack?;
-        let next_ack = self.remote_seq_no + self.rx_buffer.len();
+        let next_ack = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
         let last_win_adjusted = last_ack + last_win - next_ack;
@@ -950,6 +1077,9 @@ impl<'a> Socket<'a> {
             self.rx_waker.wake();
             self.tx_waker.wake();
         }
+
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        self.release_all_zero_copy_segments();
     }
 
     /// Start listening on the given endpoint.
@@ -1131,6 +1261,8 @@ impl<'a> Socket<'a> {
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
         self.set_state(State::Closed);
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        self.release_all_zero_copy_segments();
     }
 
     /// Return whether the socket is passively listening for incoming connections.
@@ -1381,6 +1513,114 @@ impl<'a> Socket<'a> {
         })
     }
 
+    /// Receive data via zero-copy: the closure `f` is called once per
+    /// contiguous segment with a slice pointing directly into frame memory
+    /// (e.g. DPDK hugepage mbufs). Returns the total number of bytes consumed.
+    ///
+    /// `f` receives each segment's payload slice and returns the number of
+    /// bytes consumed from that segment. Processing stops when `f` returns 0
+    /// or there are no more contiguous segments.
+    ///
+    /// After the closure returns, the backing frames for all fully consumed
+    /// segments are released via the registered [`FrameReleaseFn`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if no release function has been set via
+    /// [`set_zero_copy_release_fn`] and there are segments to release.
+    ///
+    /// # Safety contract
+    ///
+    /// The slices passed to `f` point into frame memory that is valid only
+    /// for the duration of the callback. Do not store the slice references
+    /// beyond the closure.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    pub fn recv_zero_copy<F>(&mut self, mut f: F) -> Result<usize, RecvError>
+    where
+        F: FnMut(&[u8]) -> usize,
+    {
+        self.recv_error_check()?;
+
+        if self.zc_segment_count == 0 || self.zc_contiguous_bytes == 0 {
+            return Ok(0);
+        }
+
+        let mut total_consumed: usize = 0;
+        let mut segments_consumed: usize = 0;
+
+        // Walk contiguous segments from the front.
+        let mut expected_offset: usize = 0;
+        for i in 0..self.zc_segment_count {
+            let seg = &self.zc_segments[i];
+
+            // Stop at first gap.
+            if seg.stream_offset != expected_offset {
+                break;
+            }
+
+            // Stop if we've reached the contiguous frontier.
+            if total_consumed >= self.zc_contiguous_bytes {
+                break;
+            }
+
+            // SAFETY: data_ptr is valid because the frame_handle keeps
+            // the mbuf alive, and we haven't released it yet. The pointer
+            // was obtained from a valid &[u8] slice in process_data_segment_zero_copy
+            // and the frame handle guarantees the backing memory is not freed
+            // until this release_fn call below.
+            #[allow(unsafe_code)]
+            let slice = unsafe { core::slice::from_raw_parts(seg.data_ptr, seg.data_len) };
+
+            let consumed = f(slice);
+            if consumed == 0 {
+                break;
+            }
+            debug_assert!(
+                consumed == seg.data_len,
+                "recv_zero_copy: partial segment consumption not supported \
+                 (consumed {} of {} bytes)",
+                consumed,
+                seg.data_len
+            );
+
+            total_consumed += consumed;
+            expected_offset += seg.data_len;
+            segments_consumed += 1;
+        }
+
+        // Release consumed segments.
+        if segments_consumed > 0 {
+            let release_fn = self
+                .zc_release_fn
+                .expect("zero-copy release function not set");
+            for i in 0..segments_consumed {
+                release_fn(self.zc_segments[i].frame_handle);
+            }
+
+            // Shift remaining segments down and adjust their stream_offsets.
+            let remaining = self.zc_segment_count - segments_consumed;
+            for i in 0..remaining {
+                self.zc_segments[i] = self.zc_segments[segments_consumed + i];
+                self.zc_segments[i].stream_offset -= total_consumed;
+            }
+            self.zc_segment_count = remaining;
+            self.zc_held_bytes -= total_consumed;
+            self.zc_contiguous_bytes -= total_consumed;
+
+            // Advance TCP sequence number (same as recv_impl does for ring buffer).
+            self.remote_seq_no += total_consumed;
+
+            #[cfg(any(test, feature = "verbose"))]
+            tcp_trace!(
+                "zero-copy rx: consumed {} bytes from {} segments",
+                total_consumed,
+                segments_consumed
+            );
+        }
+
+        Ok(total_consumed)
+    }
+
     /// Peek at a sequence of received octets without removing them from
     /// the receive buffer, and return a pointer to it.
     ///
@@ -1417,7 +1657,7 @@ impl<'a> Socket<'a> {
     ///
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
     pub fn recv_queue(&self) -> usize {
-        self.rx_buffer.len()
+        self.rx_buffer.len() + self.zc_held()
     }
 
     fn set_state(&mut self, state: State) {
@@ -1489,7 +1729,7 @@ impl<'a> Socket<'a> {
         // and an acknowledgment indicating the next sequence number expected
         // to be received.
         reply_repr.seq_number = self.remote_last_seq;
-        reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
+        reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len() + self.zc_held());
         self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
@@ -1706,7 +1946,7 @@ impl<'a> Socket<'a> {
             }
         }
 
-        let window_start = self.remote_seq_no + self.rx_buffer.len();
+        let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
         let window_end = if let Some(last_ack) = self.remote_last_ack {
             last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
         } else {
@@ -2373,7 +2613,7 @@ impl<'a> Socket<'a> {
         }
 
         // --- Window/sequence validation ---
-        let window_start = self.remote_seq_no + self.rx_buffer.len();
+        let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
         let window_end = if let Some(last_ack) = self.remote_last_ack {
             last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
         } else {
@@ -2590,6 +2830,299 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Process a batch of TCP segments with zero-copy frame handles.
+    ///
+    /// Each segment is paired with an [`OpaqueFrameHandle`] that keeps
+    /// the backing memory alive until released via [`recv_zero_copy()`]
+    /// or socket reset. The release function must be set via
+    /// [`set_zero_copy_release_fn()`] before calling this method.
+    ///
+    /// Mirrors [`process_batch()`] but stores segment descriptors instead
+    /// of copying payload into the ring buffer.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    pub(crate) fn process_batch_zero_copy<'p>(
+        &mut self,
+        cx: &mut Context,
+        segments: &'p [(IpRepr, TcpRepr<'p>, OpaqueFrameHandle)],
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        if segments.is_empty() {
+            return None;
+        }
+
+        // Single segment: use the zero-copy single-segment path.
+        if segments.len() == 1 {
+            return self.process_zero_copy(cx, &segments[0].0, &segments[0].1, segments[0].2);
+        }
+
+        let mut batch = BatchAccumulator::default();
+        let mut last_ip_repr = None;
+        let mut last_tcp_repr = None;
+
+        for (ip_repr, tcp_repr, frame_handle) in segments {
+            if self.state == State::Established
+                && matches!(tcp_repr.control, TcpControl::None | TcpControl::Psh)
+            {
+                match self.process_data_segment_zero_copy(
+                    cx,
+                    ip_repr,
+                    tcp_repr,
+                    *frame_handle,
+                    &mut batch,
+                ) {
+                    DataSegmentResult::Ok => {
+                        last_ip_repr = Some(ip_repr);
+                        last_tcp_repr = Some(tcp_repr);
+                        continue;
+                    }
+                    DataSegmentResult::Reply(reply) => {
+                        if batch.segments_processed > 0 {
+                            self.process_batch_finalize(
+                                cx,
+                                &batch,
+                                last_ip_repr.unwrap(),
+                                last_tcp_repr.unwrap(),
+                            );
+                        }
+                        return reply;
+                    }
+                    DataSegmentResult::Dropped => continue,
+                }
+            }
+
+            // Slow path: control segment or non-ESTABLISHED state.
+            if batch.segments_processed > 0 {
+                self.process_batch_finalize(
+                    cx,
+                    &batch,
+                    last_ip_repr.unwrap(),
+                    last_tcp_repr.unwrap(),
+                );
+                batch = BatchAccumulator::default();
+                last_ip_repr = None;
+                last_tcp_repr = None;
+            }
+
+            // Control segments fall back to regular process (no zero-copy for SYN/FIN/RST).
+            let reply = self.process(cx, ip_repr, tcp_repr);
+            if self.state == State::Closed || self.state == State::TimeWait {
+                return reply;
+            }
+        }
+
+        if batch.segments_processed > 0 {
+            self.process_batch_finalize(cx, &batch, last_ip_repr.unwrap(), last_tcp_repr.unwrap());
+
+            if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
+                let ip = last_ip_repr.unwrap();
+                let tcp = last_tcp_repr.unwrap();
+                return Some(self.ack_reply(ip, tcp));
+            }
+        }
+
+        None
+    }
+
+    /// Zero-copy variant of [`process_data_segment()`].
+    ///
+    /// Instead of copying payload into `rx_buffer`, stores a
+    /// [`ZeroCopySegment`] descriptor pointing into the frame memory.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    fn process_data_segment_zero_copy(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+        frame_handle: OpaqueFrameHandle,
+        batch: &mut BatchAccumulator,
+    ) -> DataSegmentResult {
+        debug_assert!(self.state == State::Established);
+
+        // --- ACK validation (identical to process_data_segment) ---
+        if let Some(ack_number) = repr.ack_number {
+            let unacknowledged = self.tx_buffer.len();
+            let ack_min = self.local_seq_no;
+            let ack_max = self.local_seq_no + unacknowledged;
+
+            if ack_number < ack_min {
+                return DataSegmentResult::Dropped;
+            } else if ack_number > ack_max {
+                return DataSegmentResult::Reply(self.challenge_ack_reply(cx, ip_repr, repr));
+            }
+        } else {
+            return DataSegmentResult::Dropped;
+        }
+
+        // --- Window/sequence validation ---
+        let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
+        let window_end = if let Some(last_ack) = self.remote_last_ack {
+            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+        } else {
+            window_start
+        };
+        let segment_start = repr.seq_number;
+        let segment_end = repr.seq_number + repr.payload.len();
+
+        let (payload, payload_offset) = {
+            let segment_in_window = match (segment_start == segment_end, window_start == window_end)
+            {
+                (true, _) if segment_end == window_start - 1 => false,
+                (true, true) => window_start == segment_start,
+                (true, false) => window_start <= segment_start && segment_start < window_end,
+                (false, true) => false,
+                (false, false) => {
+                    (window_start <= segment_start && segment_start < window_end)
+                        || (window_start < segment_end && segment_end <= window_end)
+                }
+            };
+
+            if segment_in_window {
+                let overlap_start = window_start.max(segment_start);
+                let overlap_end = window_end.min(segment_end);
+                debug_assert!(overlap_start <= overlap_end);
+                self.local_rx_last_seq = Some(repr.seq_number);
+                (
+                    &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
+                    overlap_start - window_start,
+                )
+            } else {
+                return DataSegmentResult::Reply(self.challenge_ack_reply(cx, ip_repr, repr));
+            }
+        };
+
+        // --- ACK len computation ---
+        if let Some(ack_number) = repr.ack_number {
+            let tx_buffer_start_seq = self.local_seq_no;
+            let mut ack_len = 0;
+            let mut ack_all = false;
+            if ack_number >= tx_buffer_start_seq {
+                ack_len = ack_number - tx_buffer_start_seq;
+                ack_all = self.remote_last_seq <= ack_number;
+            }
+
+            batch.last_ack_number = Some(ack_number);
+            batch.total_ack_len += ack_len;
+            if ack_all {
+                batch.ack_all = true;
+            }
+
+            if ack_len > 0 {
+                debug_assert!(self.tx_buffer.len() >= ack_len);
+                self.tx_buffer.dequeue_allocated(ack_len);
+                #[cfg(feature = "async")]
+                self.tx_waker.wake();
+            }
+
+            self.local_seq_no = ack_number;
+            if self.remote_last_seq < self.local_seq_no {
+                self.remote_last_seq = self.local_seq_no;
+            }
+        }
+
+        // --- Window update ---
+        let scale = self.remote_win_scale.unwrap_or(0);
+        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        batch.last_window_len = Some(new_remote_win_len);
+        batch.is_window_update =
+            batch.is_window_update || new_remote_win_len != self.remote_win_len;
+
+        // --- Timestamp ---
+        if let Some(timestamp) = repr.timestamp {
+            batch.last_timestamp_tsval = Some(timestamp.tsval);
+        }
+
+        // --- Zero-copy payload storage (replaces rx_buffer.write_unallocated) ---
+        if batch.segments_processed == 0 {
+            batch.assembler_was_empty_at_start = self.assembler.is_empty();
+        }
+
+        let payload_len = payload.len();
+        if payload_len > 0 {
+            let Ok(contig_len) = self
+                .assembler
+                .add_then_remove_front(payload_offset, payload_len)
+            else {
+                return DataSegmentResult::Dropped;
+            };
+
+            // Store a descriptor instead of copying into rx_buffer.
+            if self.zc_segment_count >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
+                return DataSegmentResult::Dropped;
+            }
+
+            // Compute absolute stream offset: zc_contiguous_bytes is the
+            // "virtual rx_buffer.len()" and payload_offset is relative to the
+            // current window start, so their sum gives the absolute position.
+            let abs_offset = self.zc_contiguous_bytes + payload_offset;
+
+            let seg = ZeroCopySegment {
+                data_ptr: payload.as_ptr(),
+                data_len: payload_len,
+                stream_offset: abs_offset,
+                frame_handle,
+            };
+
+            // Insert sorted by stream_offset (typically appends at end for in-order data).
+            let insert_pos = self.zc_segments[..self.zc_segment_count]
+                .partition_point(|s| s.stream_offset < abs_offset);
+            // Shift right to make room.
+            let count = self.zc_segment_count;
+            self.zc_segments
+                .copy_within(insert_pos..count, insert_pos + 1);
+            self.zc_segments[insert_pos] = seg;
+            self.zc_segment_count += 1;
+            self.zc_held_bytes += payload_len;
+
+            if contig_len != 0 {
+                self.zc_contiguous_bytes += contig_len;
+                #[cfg(feature = "async")]
+                self.rx_waker.wake();
+            }
+
+            batch.payload_bytes += payload_len;
+        }
+
+        batch.segments_processed += 1;
+        DataSegmentResult::Ok
+    }
+
+    /// Zero-copy variant of [`process()`] for single-segment processing.
+    ///
+    /// Handles all TCP states (not just ESTABLISHED) but only applies
+    /// zero-copy storage for data payload on ESTABLISHED connections.
+    /// Control segments (SYN, FIN, RST) are handled identically to [`process()`].
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    pub(crate) fn process_zero_copy(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+        frame_handle: OpaqueFrameHandle,
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        // For non-ESTABLISHED states or control segments, delegate to the
+        // regular process() path — zero-copy only applies to data on
+        // established connections.
+        if self.state != State::Established
+            || !matches!(repr.control, TcpControl::None | TcpControl::Psh)
+            || repr.payload.is_empty()
+        {
+            return self.process(cx, ip_repr, repr);
+        }
+
+        // Use the batch path with a single-element batch for consistency.
+        let mut batch = BatchAccumulator::default();
+        match self.process_data_segment_zero_copy(cx, ip_repr, repr, frame_handle, &mut batch) {
+            DataSegmentResult::Ok => {
+                self.process_batch_finalize(cx, &batch, ip_repr, repr);
+                if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
+                    return Some(self.ack_reply(ip_repr, repr));
+                }
+                None
+            }
+            DataSegmentResult::Reply(reply) => reply,
+            DataSegmentResult::Dropped => None,
+        }
+    }
+
     fn timed_out(&self, timestamp: Instant) -> bool {
         match (self.remote_last_ts, self.timeout) {
             (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
@@ -2674,7 +3207,7 @@ impl<'a> Socket<'a> {
 
     fn ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack < self.remote_seq_no + self.rx_buffer.len()
+            remote_last_ack < self.remote_seq_no + self.rx_buffer.len() + self.zc_held()
         } else {
             false
         }
@@ -2692,7 +3225,8 @@ impl<'a> Socket<'a> {
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack + self.remote_mss < self.remote_seq_no + self.rx_buffer.len()
+            remote_last_ack + self.remote_mss
+                < self.remote_seq_no + self.rx_buffer.len() + self.zc_held()
         } else {
             false
         }
@@ -2884,7 +3418,7 @@ impl<'a> Socket<'a> {
             dst_port: tuple.remote.port,
             control: TcpControl::None,
             seq_number: self.remote_last_seq,
-            ack_number: Some(self.remote_seq_no + self.rx_buffer.len()),
+            ack_number: Some(self.remote_seq_no + self.rx_buffer.len() + self.zc_held()),
             window_len: self.scaled_window(),
             window_scale: None,
             max_seg_size: None,
@@ -9698,5 +10232,347 @@ mod test {
         s.send_slice(b"def").unwrap();
         recv_nothing!(s);
         assert_eq!(s.state, State::Closed);
+    }
+
+    // ========================================================================
+    // Zero-copy RX tests
+    // ========================================================================
+
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    mod zero_copy_rx {
+        use super::*;
+
+        /// Tracks released frame handles per-thread for test verification.
+        /// Thread-local avoids interference between parallel tests.
+        use std::cell::RefCell;
+        thread_local! {
+            static RELEASED_HANDLES: RefCell<Vec<[u8; 16]>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn clear_released() {
+            RELEASED_HANDLES.with(|h| h.borrow_mut().clear());
+        }
+
+        fn released_handles() -> Vec<[u8; 16]> {
+            RELEASED_HANDLES.with(|h| h.borrow().clone())
+        }
+
+        fn test_release_fn(handle: OpaqueFrameHandle) {
+            RELEASED_HANDLES.with(|h| h.borrow_mut().push(handle.bytes));
+        }
+
+        fn make_handle(id: u8) -> OpaqueFrameHandle {
+            let mut bytes = [0u8; 16];
+            bytes[0] = id;
+            OpaqueFrameHandle { bytes }
+        }
+
+        #[test]
+        fn test_zero_copy_basic_recv() {
+            clear_released();
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            let ip_repr = RECV_IP_TEMPL;
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"hello",
+                ..SEND_TEMPL
+            };
+
+            let segments = [(ip_repr, seg, make_handle(1))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            // Data should be available via zero-copy recv.
+            let mut received = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|slice| {
+                    received.extend_from_slice(slice);
+                    slice.len()
+                })
+                .unwrap();
+
+            assert_eq!(consumed, 5);
+            assert_eq!(&received, b"hello");
+
+            // Frame handle should have been released.
+            let released = released_handles();
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0][0], 1);
+        }
+
+        #[test]
+        fn test_zero_copy_batch_multiple_segments() {
+            clear_released();
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            let ip_repr = RECV_IP_TEMPL;
+            let seg1 = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abc",
+                ..SEND_TEMPL
+            };
+            let seg2 = TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"def",
+                ..SEND_TEMPL
+            };
+
+            let segments = [
+                (ip_repr.clone(), seg1, make_handle(1)),
+                (ip_repr, seg2, make_handle(2)),
+            ];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            let mut received = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|slice| {
+                    received.extend_from_slice(slice);
+                    slice.len()
+                })
+                .unwrap();
+
+            assert_eq!(consumed, 6);
+            assert_eq!(&received, b"abcdef");
+
+            let released = released_handles();
+            assert_eq!(released.len(), 2);
+            assert_eq!(released[0][0], 1);
+            assert_eq!(released[1][0], 2);
+        }
+
+        #[test]
+        fn test_zero_copy_partial_consume() {
+            clear_released();
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            let ip_repr = RECV_IP_TEMPL;
+            let seg1 = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abc",
+                ..SEND_TEMPL
+            };
+            let seg2 = TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"def",
+                ..SEND_TEMPL
+            };
+
+            let segments = [
+                (ip_repr.clone(), seg1, make_handle(1)),
+                (ip_repr, seg2, make_handle(2)),
+            ];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            // Consume only the first segment (return 0 for the second).
+            let mut call_count = 0;
+            let consumed = s
+                .socket
+                .recv_zero_copy(|slice| {
+                    call_count += 1;
+                    if call_count == 1 {
+                        assert_eq!(slice, b"abc");
+                        slice.len()
+                    } else {
+                        0 // stop
+                    }
+                })
+                .unwrap();
+
+            assert_eq!(consumed, 3);
+            assert_eq!(call_count, 2);
+
+            // Only handle 1 released, handle 2 still held.
+            let released = released_handles();
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0][0], 1);
+
+            // Second segment still available.
+            let mut received = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|slice| {
+                    received.extend_from_slice(slice);
+                    slice.len()
+                })
+                .unwrap();
+            assert_eq!(consumed, 3);
+            assert_eq!(&received, b"def");
+        }
+
+        #[test]
+        fn test_zero_copy_release_on_reset() {
+            clear_released();
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            let ip_repr = RECV_IP_TEMPL;
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"data",
+                ..SEND_TEMPL
+            };
+
+            let segments = [(ip_repr, seg, make_handle(42))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            // Abort releases all held segments.
+            s.socket.abort();
+
+            let released = released_handles();
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0][0], 42);
+        }
+
+        #[test]
+        fn test_zero_copy_window_accounting() {
+            clear_released();
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            let initial_window = s.socket.scaled_window();
+
+            let ip_repr = RECV_IP_TEMPL;
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"hello",
+                ..SEND_TEMPL
+            };
+
+            let segments = [(ip_repr, seg, make_handle(1))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            // Window should shrink by the held bytes.
+            let window_after = s.socket.scaled_window();
+            assert!(
+                window_after < initial_window,
+                "window should shrink: {} < {}",
+                window_after,
+                initial_window
+            );
+
+            // recv_queue should include zero-copy held bytes.
+            assert_eq!(s.socket.recv_queue(), 5);
+
+            // After consuming, window should recover.
+            s.socket.recv_zero_copy(|slice| slice.len()).unwrap();
+            let window_final = s.socket.scaled_window();
+            assert_eq!(window_final, initial_window);
+            assert_eq!(s.socket.recv_queue(), 0);
+        }
+
+        #[test]
+        fn test_zero_copy_single_segment_path() {
+            clear_released();
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            let ip_repr = RECV_IP_TEMPL;
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"single",
+                ..SEND_TEMPL
+            };
+
+            // Single-element batch triggers the single-segment fast path.
+            let segments = [(ip_repr, seg, make_handle(7))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            let mut received = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|slice| {
+                    received.extend_from_slice(slice);
+                    slice.len()
+                })
+                .unwrap();
+
+            assert_eq!(consumed, 6);
+            assert_eq!(&received, b"single");
+
+            let released = released_handles();
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0][0], 7);
+        }
+
+        #[test]
+        fn test_zero_copy_existing_recv_unchanged() {
+            // Verify that the existing ring-buffer recv path still works
+            // when zero-copy feature is enabled but not used.
+            let mut s = socket_established();
+            s.cx.set_now(Instant::from_millis(0));
+
+            let ip_repr = RECV_IP_TEMPL;
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"ring_buffer",
+                ..SEND_TEMPL
+            };
+
+            // Use the regular (non-zero-copy) process_batch.
+            let segments = [(ip_repr, seg)];
+            let _reply = s.socket.process_batch(&mut s.cx, &segments);
+
+            let mut buf = [0u8; 11];
+            let n = s.socket.recv_slice(&mut buf).unwrap();
+            assert_eq!(n, 11);
+            assert_eq!(&buf, b"ring_buffer");
+        }
+
+        #[test]
+        fn test_zero_copy_empty_recv() {
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+
+            // No data — recv_zero_copy returns 0.
+            let consumed = s.socket.recv_zero_copy(|_| unreachable!()).unwrap();
+            assert_eq!(consumed, 0);
+        }
+
+        #[test]
+        fn test_zero_copy_control_segment_fallback() {
+            clear_released();
+            let mut s = socket_established();
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            let ip_repr = RECV_IP_TEMPL;
+
+            // RST segment — should be handled by regular process(), not zero-copy.
+            let rst = TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            };
+
+            let segments = [(ip_repr, rst, make_handle(99))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            // Socket should be closed (RST processed).
+            assert_eq!(s.socket.state(), State::Closed);
+
+            // No zero-copy segments should be held (RST has no payload).
+            assert_eq!(released_handles().len(), 0);
+        }
     }
 }

@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+use crate::socket::tcp::OpaqueFrameHandle;
 use crate::socket::tcp::Socket;
 
 impl InterfaceInner {
@@ -114,6 +116,48 @@ impl InterfaceInner {
         }
 
         // No socket matched — send RST for the first segment.
+        if first_tcp.control == TcpControl::Rst
+            || first_ip.dst_addr().is_unspecified()
+            || first_ip.src_addr().is_unspecified()
+            || handled_by_raw_socket
+        {
+            None
+        } else {
+            let (ip, tcp) = tcp::Socket::rst_reply(first_ip, first_tcp);
+            Some(Packet::new(ip, IpPayload::Tcp(tcp)))
+        }
+    }
+
+    /// Process a batch of pre-parsed TCP segments with zero-copy frame handles.
+    ///
+    /// Each segment carries an [`OpaqueFrameHandle`] that keeps the backing
+    /// frame memory alive until the application consumes data via
+    /// [`Socket::recv_zero_copy()`].
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    #[allow(dead_code)]
+    pub(crate) fn process_tcp_batch_zero_copy<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        handled_by_raw_socket: bool,
+        segments: &'frame [(IpRepr, TcpRepr<'frame>, OpaqueFrameHandle)],
+    ) -> Option<Packet<'frame>> {
+        if segments.is_empty() {
+            return None;
+        }
+
+        let (first_ip, first_tcp, _) = &segments[0];
+
+        for tcp_socket in sockets
+            .items_mut()
+            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
+        {
+            if tcp_socket.accepts(self, first_ip, first_tcp) {
+                return tcp_socket
+                    .process_batch_zero_copy(self, segments)
+                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+            }
+        }
+
         if first_tcp.control == TcpControl::Rst
             || first_ip.dst_addr().is_unspecified()
             || first_ip.src_addr().is_unspecified()
