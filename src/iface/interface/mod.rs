@@ -940,27 +940,6 @@ impl Interface {
         }
         result
     }
-
-    /// Process a batch of pre-parsed TCP segments with zero-copy frame handles.
-    ///
-    /// Forwards to [`InterfaceInner::process_tcp_batch_zero_copy`]. Each segment
-    /// carries an [`OpaqueFrameHandle`] that keeps the backing frame memory alive
-    /// until the application consumes data via [`tcp::Socket::recv_zero_copy()`].
-    #[cfg(feature = "socket-tcp-zero-copy-rx")]
-    #[allow(private_interfaces)]
-    pub fn process_tcp_batch_zero_copy<'frame>(
-        &mut self,
-        sockets: &mut SocketSet,
-        handled_by_raw_socket: bool,
-        segments: &'frame [(
-            IpRepr,
-            TcpRepr<'frame>,
-            crate::socket::tcp::OpaqueFrameHandle,
-        )],
-    ) -> Option<Packet<'frame>> {
-        self.inner
-            .process_tcp_batch_zero_copy(sockets, handled_by_raw_socket, segments)
-    }
 }
 
 impl InterfaceInner {
