@@ -236,6 +236,9 @@ struct RttEstimator {
     timestamp: Option<(Instant, TcpSeqNumber)>,
     max_seq_sent: Option<TcpSeqNumber>,
     rto_count: u8,
+    /// Per-socket RTO bounds (milliseconds). Defaults match RFC 6298.
+    min_rto: u32,
+    max_rto: u32,
 }
 
 impl Default for RttEstimator {
@@ -248,6 +251,8 @@ impl Default for RttEstimator {
             timestamp: None,
             max_seq_sent: None,
             rto_count: 0,
+            min_rto: RTTE_MIN_RTO,
+            max_rto: RTTE_MAX_RTO,
         }
     }
 }
@@ -272,7 +277,7 @@ impl RttEstimator {
 
         // RFC 6298 (2.2), (2.3)
         let margin = RTTE_MIN_MARGIN.max(self.rttvar * RTTE_K);
-        self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
+        self.rto = (self.srtt + margin).clamp(self.min_rto, self.max_rto);
 
         self.rto_count = 0;
 
@@ -317,7 +322,7 @@ impl RttEstimator {
         // RFC 6298 (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").  The
         // maximum value discussed in (2.5) above may be used to provide
         // an upper bound to this doubling operation.
-        self.rto = (self.rto * 2).min(RTTE_MAX_RTO);
+        self.rto = (self.rto * 2).min(self.max_rto);
         tcp_trace!("rtte: doubling rto to {:?}", self.rto);
 
         // RFC 6298: a TCP implementation MAY clear SRTT and RTTVAR after
@@ -965,6 +970,62 @@ impl<'a> Socket<'a> {
     /// has ACK delay enabled.
     pub fn set_nagle_enabled(&mut self, enabled: bool) {
         self.nagle = enabled
+    }
+
+    /// Set the minimum retransmission timeout (RTO).
+    ///
+    /// RFC 6298 recommends a minimum of 1 second. For low-latency LAN
+    /// environments, this can be lowered significantly (e.g., 10ms) to
+    /// reduce tail latency on packet loss.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_rto` is zero.
+    pub fn set_min_rto(&mut self, min_rto: Duration) {
+        let ms = min_rto.total_millis() as u32;
+        assert!(ms > 0, "min_rto must be > 0");
+        assert!(ms <= self.rtte.max_rto, "min_rto must be <= max_rto");
+        self.rtte.min_rto = ms;
+        // Clamp current RTO to new bounds.
+        self.rtte.rto = self.rtte.rto.max(self.rtte.min_rto);
+    }
+
+    /// Set the maximum retransmission timeout (RTO).
+    ///
+    /// RFC 6298 recommends at least 60 seconds. For low-latency environments,
+    /// a lower value (e.g., 5 seconds) limits worst-case retransmit stalls.
+    pub fn set_max_rto(&mut self, max_rto: Duration) {
+        let ms = max_rto.total_millis() as u32;
+        assert!(ms >= self.rtte.min_rto, "max_rto must be >= min_rto");
+        self.rtte.max_rto = ms;
+        // Clamp current RTO to new bounds.
+        self.rtte.rto = self.rtte.rto.min(self.rtte.max_rto);
+    }
+
+    /// Set the initial retransmission timeout (RTO) used before the first
+    /// RTT sample is collected.
+    ///
+    /// RFC 6298 recommends 1 second. For LAN environments with known
+    /// sub-millisecond RTT, this can be lowered to reduce connection setup
+    /// latency and first-loss recovery time.
+    pub fn set_initial_rto(&mut self, initial_rto: Duration) {
+        let ms = initial_rto.total_millis() as u32;
+        if !self.rtte.have_measurement {
+            self.rtte.rto = ms.clamp(self.rtte.min_rto, self.rtte.max_rto);
+        }
+    }
+
+    /// Set the initial congestion window size in bytes.
+    ///
+    /// The default depends on the congestion control algorithm (typically
+    /// 2048 bytes for Reno). For trusted LAN environments, a larger initial
+    /// window (e.g., 65535) allows immediate full-speed transmission without
+    /// slow start.
+    pub fn set_initial_congestion_window(&mut self, cwnd: usize) {
+        assert!(cwnd > 0, "initial congestion window must be > 0");
+        self.congestion_controller
+            .inner_mut()
+            .set_initial_window(cwnd);
     }
 
     /// Return the keep-alive interval.
