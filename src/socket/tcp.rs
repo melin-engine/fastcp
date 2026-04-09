@@ -152,6 +152,13 @@ struct ZeroCopySegment {
     frame_handle: OpaqueFrameHandle,
 }
 
+// SAFETY: ZeroCopySegment's data_ptr points into externally-owned frame
+// memory (e.g. DPDK mbufs). The pointer is valid as long as the
+// frame_handle has not been released, and ownership is tracked by the
+// transport layer — not shared across threads.
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+unsafe impl Send for ZeroCopySegment {}
+
 #[cfg(feature = "socket-tcp-zero-copy-rx")]
 impl Default for ZeroCopySegment {
     fn default() -> Self {
