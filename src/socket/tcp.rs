@@ -3333,12 +3333,23 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    /// Like [`dispatch`], but emits as many segments as possible in a single call.
+    /// Like [`dispatch`], but emits multiple segments in a single call.
     ///
     /// The `emit` closure is called once per segment — it uses `FnMut` so it can
     /// be invoked multiple times. This avoids the overhead of re-entering the
     /// dispatch path and re-iterating all sockets for each segment.
-    pub(crate) fn dispatch_burst<F, E>(&mut self, cx: &mut Context, mut emit: F) -> Result<(), E>
+    ///
+    /// Emits at most `max_segments` data segments per call to bound the
+    /// per-socket work in one egress pass. Control segments (ACKs, window
+    /// updates, RST, keepalive) don't count toward the cap — they're cheap
+    /// and must not be deferred. When the cap is reached, the caller's
+    /// egress loop will revisit this socket on the next pass.
+    pub(crate) fn dispatch_burst<F, E>(
+        &mut self,
+        cx: &mut Context,
+        max_segments: usize,
+        mut emit: F,
+    ) -> Result<(), E>
     where
         F: FnMut(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
@@ -3346,9 +3357,15 @@ impl<'a> Socket<'a> {
             return Ok(());
         };
 
+        let mut data_segments = 0;
         loop {
             match self.dispatch_one(cx, tuple, &mut emit)? {
-                true => continue,
+                true => {
+                    data_segments += 1;
+                    if data_segments >= max_segments {
+                        return Ok(());
+                    }
+                }
                 false => return Ok(()),
             }
         }
@@ -6895,7 +6912,7 @@ mod test {
         let mut segments: Vec<TcpRepr<'static>> = Vec::new();
         let result: Result<(), ()> =
             s.socket
-                .dispatch_burst(&mut s.cx, |_, (_ip_repr, tcp_repr)| {
+                .dispatch_burst(&mut s.cx, 64, |_, (_ip_repr, tcp_repr)| {
                     segments.push(TcpRepr {
                         // Copy payload into owned 'static form for assertion.
                         payload: &[],
@@ -6928,7 +6945,7 @@ mod test {
         let mut call_count = 0;
         let result: Result<(), ()> =
             s.socket
-                .dispatch_burst(&mut s.cx, |_, (_ip_repr, _tcp_repr)| {
+                .dispatch_burst(&mut s.cx, 64, |_, (_ip_repr, _tcp_repr)| {
                     call_count += 1;
                     if call_count >= 2 { Err(()) } else { Ok(()) }
                 });
@@ -6946,7 +6963,7 @@ mod test {
         let mut call_count = 0;
         let result: Result<(), ()> =
             s.socket
-                .dispatch_burst(&mut s.cx, |_, (_ip_repr, _tcp_repr)| {
+                .dispatch_burst(&mut s.cx, 64, |_, (_ip_repr, _tcp_repr)| {
                     call_count += 1;
                     Ok(())
                 });
@@ -6954,6 +6971,28 @@ mod test {
         assert_eq!(
             call_count, 0,
             "No segments should be emitted when nothing to send"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_burst_respects_max_segments() {
+        let mut s = socket_established();
+        // MSS of 4 means 20 bytes needs 5 segments. Cap at 2.
+        s.remote_mss = 4;
+        s.send_slice(b"01234567890123456789").unwrap();
+
+        s.cx.set_now(Instant::from_millis(0));
+        let mut call_count = 0;
+        let result: Result<(), ()> =
+            s.socket
+                .dispatch_burst(&mut s.cx, 2, |_, (_ip_repr, _tcp_repr)| {
+                    call_count += 1;
+                    Ok(())
+                });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            call_count, 2,
+            "dispatch_burst should stop after max_segments data segments"
         );
     }
 

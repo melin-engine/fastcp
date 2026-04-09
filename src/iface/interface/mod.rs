@@ -895,7 +895,10 @@ impl Interface {
                 }
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => {
-                    socket.dispatch_burst(&mut self.inner, |inner, (ip, tcp)| {
+                    // Cap data segments per socket per egress pass so one
+                    // connection's burst doesn't delay all others. The outer
+                    // poll_egress loop revisits sockets that have more to send.
+                    socket.dispatch_burst(&mut self.inner, 4, |inner, (ip, tcp)| {
                         respond(
                             inner,
                             PacketMeta::default(),
