@@ -166,6 +166,12 @@ pub struct InterfaceInner {
     /// Maps 4-tuple → SocketHandle, avoiding the O(N) socket scan per packet.
     #[cfg(feature = "socket-tcp")]
     tcp_socket_index: super::tcp_socket_index::TcpSocketIndex,
+
+    /// Pending zero-copy frame handle for the current ingress frame.
+    /// Set by `poll_ingress_batch_zero_copy` before calling `process_ingress_frame`,
+    /// consumed by `process_tcp` if the frame is TCP. Cleared after each frame.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    pub(super) pending_zc_handle: Option<crate::socket::tcp::OpaqueFrameHandle>,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -299,6 +305,8 @@ impl Interface {
                 cached_hardware_addr: None,
                 #[cfg(feature = "socket-tcp")]
                 tcp_socket_index: super::tcp_socket_index::TcpSocketIndex::new(),
+                #[cfg(feature = "socket-tcp-zero-copy-rx")]
+                pending_zc_handle: None,
                 rand,
             },
         }
@@ -604,6 +612,48 @@ impl Interface {
             if self.process_ingress_frame(device, sockets, frame) {
                 result = PollResult::SocketStateChanged;
             }
+        }
+
+        result
+    }
+
+    /// Like [`poll_ingress_batch`], but uses the zero-copy receive path for
+    /// TCP data segments. Each frame is paired with an [`OpaqueFrameHandle`]
+    /// that the socket stores instead of copying the payload.
+    ///
+    /// When a socket stores a segment, it calls the registered
+    /// [`FrameRetainFn`] to signal the transport that the backing memory
+    /// must survive beyond this batch. The [`FrameReleaseFn`] is called
+    /// later when the application consumes the data via [`recv_zero_copy`].
+    /// Non-TCP frames (ARP, ICMP) are processed normally and the handle
+    /// is ignored.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    pub fn poll_ingress_batch_zero_copy(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        frames: &[(&[u8], crate::socket::tcp::OpaqueFrameHandle)],
+    ) -> PollResult {
+        self.inner.now = timestamp;
+
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragments.assembler.remove_expired(timestamp);
+
+        let mut result = PollResult::None;
+
+        for &(frame, handle) in frames {
+            if frame.is_empty() {
+                continue;
+            }
+
+            self.inner.pending_zc_handle = Some(handle);
+
+            if self.process_ingress_frame(device, sockets, frame) {
+                result = PollResult::SocketStateChanged;
+            }
+
+            self.inner.pending_zc_handle = None;
         }
 
         result

@@ -134,6 +134,13 @@ impl OpaqueFrameHandle {
 #[cfg(feature = "socket-tcp-zero-copy-rx")]
 pub type FrameReleaseFn = fn(OpaqueFrameHandle);
 
+/// Function pointer type for retaining a borrowed frame.
+/// Called when the socket stores a zero-copy segment — signals the
+/// transport that this frame's backing memory must survive beyond
+/// the current ingress batch (e.g., bump DPDK mbuf refcount).
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+pub type FrameRetainFn = fn(OpaqueFrameHandle);
+
 /// Descriptor for a segment whose payload lives in externally-owned
 /// frame memory (e.g. a DPDK mbuf in hugepage memory).
 ///
@@ -157,6 +164,7 @@ struct ZeroCopySegment {
 // frame_handle has not been released, and ownership is tracked by the
 // transport layer — not shared across threads.
 #[cfg(feature = "socket-tcp-zero-copy-rx")]
+#[allow(unsafe_code)]
 unsafe impl Send for ZeroCopySegment {}
 
 #[cfg(feature = "socket-tcp-zero-copy-rx")]
@@ -636,6 +644,9 @@ pub struct Socket<'a> {
     /// Callback for releasing frames when segments are consumed or the socket is reset.
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
     zc_release_fn: Option<FrameReleaseFn>,
+    /// Callback for retaining frames when the socket stores a zero-copy segment.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_retain_fn: Option<FrameRetainFn>,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -747,6 +758,8 @@ impl<'a> Socket<'a> {
             zc_held_bytes: 0,
             #[cfg(feature = "socket-tcp-zero-copy-rx")]
             zc_release_fn: None,
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_retain_fn: None,
         }
     }
 
@@ -882,6 +895,15 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
     pub fn set_zero_copy_release_fn(&mut self, f: FrameReleaseFn) {
         self.zc_release_fn = Some(f);
+    }
+
+    /// Register the callback invoked when the socket stores a zero-copy
+    /// segment. The transport uses this to keep the backing frame alive
+    /// (e.g., bump DPDK mbuf refcount) so it survives beyond the current
+    /// ingress batch.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    pub fn set_zero_copy_retain_fn(&mut self, f: FrameRetainFn) {
+        self.zc_retain_fn = Some(f);
     }
 
     /// Release all held zero-copy segments, calling the release function for each.
@@ -1447,10 +1469,18 @@ impl<'a> Socket<'a> {
         self.tx_buffer.capacity()
     }
 
-    /// Check whether the receive buffer is not empty.
+    /// Check whether there is data available to receive (either in the
+    /// ring buffer or in zero-copy segments).
     #[inline]
     pub fn can_recv(&self) -> bool {
-        !self.rx_buffer.is_empty()
+        if !self.rx_buffer.is_empty() {
+            return true;
+        }
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        if self.zc_contiguous_bytes > 0 {
+            return true;
+        }
+        false
     }
 
     fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
@@ -3109,11 +3139,16 @@ impl<'a> Socket<'a> {
                 .assembler
                 .add_then_remove_front(payload_offset, payload_len)
             else {
+                // Assembler full — drop the segment. Retain was not called,
+                // so the backing frame is freed normally by batch recycle.
                 return DataSegmentResult::Dropped;
             };
 
             // Store a descriptor instead of copying into rx_buffer.
             if self.zc_segment_count >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
+                // Array full — drop the segment. The retain callback was
+                // NOT called, so the backing frame will be freed normally
+                // by the transport's batch recycle.
                 return DataSegmentResult::Dropped;
             }
 
@@ -3139,6 +3174,12 @@ impl<'a> Socket<'a> {
             self.zc_segments[insert_pos] = seg;
             self.zc_segment_count += 1;
             self.zc_held_bytes += payload_len;
+
+            // Notify the transport that this frame is retained — it must
+            // keep the backing memory alive until the release callback.
+            if let Some(retain_fn) = self.zc_retain_fn {
+                retain_fn(frame_handle);
+            }
 
             if contig_len != 0 {
                 self.zc_contiguous_bytes += contig_len;

@@ -21,6 +21,12 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
+        // Pick the process method: zero-copy if a handle is pending, regular otherwise.
+        // process_zero_copy falls back to regular process() for control segments
+        // and non-established connections, so this is always safe.
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        let zc_handle = self.pending_zc_handle.take();
+
         // Fast path: O(1) index lookup for established connections.
         if let Some(handle) = self.tcp_socket_index.get(
             ip_repr.dst_addr(),
@@ -33,6 +39,12 @@ impl InterfaceInner {
             if let Some(tcp_socket) = Socket::downcast_mut(sockets.get_socket_mut(handle))
                 && tcp_socket.accepts(self, &ip_repr, &tcp_repr)
             {
+                #[cfg(feature = "socket-tcp-zero-copy-rx")]
+                if let Some(fh) = zc_handle {
+                    return tcp_socket
+                        .process_zero_copy(self, &ip_repr, &tcp_repr, fh)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                }
                 return tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
@@ -48,6 +60,17 @@ impl InterfaceInner {
                 continue;
             };
             if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                #[cfg(feature = "socket-tcp-zero-copy-rx")]
+                let result = if let Some(fh) = zc_handle {
+                    tcp_socket
+                        .process_zero_copy(self, &ip_repr, &tcp_repr, fh)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)))
+                } else {
+                    tcp_socket
+                        .process(self, &ip_repr, &tcp_repr)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)))
+                };
+                #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
                 let result = tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
