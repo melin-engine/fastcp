@@ -29,6 +29,16 @@ pub(crate) struct Item<'a> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SocketHandle(usize);
 
+impl SocketHandle {
+    /// Raw slab index backing this handle. Stable for the lifetime of the
+    /// socket; may be reused after the socket is removed. Useful for
+    /// indexing parallel per-socket state in a dense `Vec` instead of a
+    /// `HashMap<SocketHandle, _>`.
+    pub fn index(&self) -> usize {
+        self.0
+    }
+}
+
 impl fmt::Display for SocketHandle {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "#{}", self.0)
