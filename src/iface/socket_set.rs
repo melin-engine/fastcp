@@ -129,15 +129,13 @@ impl<'a> SocketSet<'a> {
 
     /// Get a mutable reference to the raw socket enum by its handle.
     ///
-    /// Unlike [`get_mut`], this does not downcast to a specific socket type.
-    ///
-    /// # Panics
-    /// This function may panic if the handle does not belong to this socket set.
-    pub(crate) fn get_socket_mut(&mut self, handle: SocketHandle) -> &mut Socket<'a> {
-        match self.sockets[handle.0].inner.as_mut() {
-            Some(item) => &mut item.socket,
-            None => panic!("handle does not refer to a valid socket"),
-        }
+    /// Unlike [`get_mut`], this does not downcast to a specific socket type
+    /// and returns `None` if the slot is empty (handle removed) instead of
+    /// panicking. Used by the per-4-tuple TCP index, which can hold stale
+    /// handles between an explicit `remove()` and the next packet that
+    /// would refresh the index.
+    pub(crate) fn try_get_socket_mut(&mut self, handle: SocketHandle) -> Option<&mut Socket<'a>> {
+        self.sockets[handle.0].inner.as_mut().map(|item| &mut item.socket)
     }
 
     /// Remove a socket from the set, without changing its state.

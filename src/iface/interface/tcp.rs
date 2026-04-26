@@ -34,9 +34,12 @@ impl InterfaceInner {
             ip_repr.src_addr(),
             tcp_repr.src_port,
         ) {
-            // Guard against handle reuse: the slot may now hold a non-TCP socket
-            // if the original was removed and the handle recycled.
-            if let Some(tcp_socket) = Socket::downcast_mut(sockets.get_socket_mut(handle))
+            // Guard against (a) the slot being empty because the socket
+            // was removed without the index being notified, and (b) the
+            // slot holding a non-TCP socket because the handle was
+            // recycled into a different socket type.
+            if let Some(socket_ref) = sockets.try_get_socket_mut(handle)
+                && let Some(tcp_socket) = Socket::downcast_mut(socket_ref)
                 && tcp_socket.accepts(self, &ip_repr, &tcp_repr)
             {
                 #[cfg(feature = "socket-tcp-zero-copy-rx")]
