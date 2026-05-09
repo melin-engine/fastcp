@@ -647,7 +647,23 @@ pub struct Socket<'a> {
     /// Callback for retaining frames when the socket stores a zero-copy segment.
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
     zc_retain_fn: Option<FrameRetainFn>,
+
+    /// Maximum data segments this socket may dispatch in a single
+    /// `dispatch_burst` call (i.e. one egress pass over the socket
+    /// set). Lower values keep tail latency tight under heavy fan-in
+    /// (one connection's burst doesn't delay all others). Higher
+    /// values give the socket a larger share of the egress thread's
+    /// time per outer poll iteration — useful for bulk single-flow
+    /// workloads (e.g. replication) coexisting on the same iface as
+    /// many short trading flows.
+    dispatch_burst_limit: usize,
 }
+
+/// Default `dispatch_burst_limit` for a freshly-constructed [`Socket`].
+/// Tuned for low-tail-latency fan-in (many trading clients on one
+/// iface): one socket can ship at most this many data segments in a
+/// single egress pass before yielding to peers.
+pub const DEFAULT_DISPATCH_BURST_LIMIT: usize = 4;
 
 const DEFAULT_MSS: usize = 536;
 
@@ -756,6 +772,7 @@ impl<'a> Socket<'a> {
             zc_contiguous_bytes: 0,
             #[cfg(feature = "socket-tcp-zero-copy-rx")]
             zc_held_bytes: 0,
+            dispatch_burst_limit: DEFAULT_DISPATCH_BURST_LIMIT,
             #[cfg(feature = "socket-tcp-zero-copy-rx")]
             zc_release_fn: None,
             #[cfg(feature = "socket-tcp-zero-copy-rx")]
@@ -876,6 +893,31 @@ impl<'a> Socket<'a> {
     /// See also the [set_nagle_enabled](#method.set_nagle_enabled) method.
     pub fn nagle_enabled(&self) -> bool {
         self.nagle
+    }
+
+    /// Maximum data segments this socket dispatches in a single
+    /// `dispatch_burst` egress pass. Defaults to
+    /// [`DEFAULT_DISPATCH_BURST_LIMIT`].
+    pub fn dispatch_burst_limit(&self) -> usize {
+        self.dispatch_burst_limit
+    }
+
+    /// Set the per-socket data-segment cap for one `dispatch_burst`
+    /// egress pass.
+    ///
+    /// Lower values (the default 4) bound how many segments any one
+    /// socket can ship before yielding to its peers — important for
+    /// p99 fairness when many short flows share an iface.
+    ///
+    /// Higher values are appropriate for a single bulk flow that
+    /// shares an iface with low-rate sockets; raising the cap lets
+    /// the bulk flow ship a larger share of segments per outer poll
+    /// iteration without changing the fairness for the others (their
+    /// own caps stay at the default).
+    ///
+    /// `n` must be ≥ 1; smaller values are clamped to 1.
+    pub fn set_dispatch_burst_limit(&mut self, n: usize) {
+        self.dispatch_burst_limit = n.max(1);
     }
 
     /// Pause sending of SYN|ACK packets.

@@ -945,10 +945,17 @@ impl Interface {
                 }
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => {
-                    // Cap data segments per socket per egress pass so one
-                    // connection's burst doesn't delay all others. The outer
-                    // poll_egress loop revisits sockets that have more to send.
-                    socket.dispatch_burst(&mut self.inner, 4, |inner, (ip, tcp)| {
+                    // Per-socket data-segment cap. Default (4) keeps
+                    // tail latency tight under heavy fan-in (one
+                    // connection's burst doesn't delay all others);
+                    // bulk flows (e.g. replication) can raise their
+                    // own cap via `set_dispatch_burst_limit` to claim
+                    // a larger share of the egress thread when they
+                    // coexist with many low-rate sockets. The outer
+                    // poll_egress loop still revisits sockets that
+                    // have more to send.
+                    let cap = socket.dispatch_burst_limit();
+                    socket.dispatch_burst(&mut self.inner, cap, |inner, (ip, tcp)| {
                         respond(
                             inner,
                             PacketMeta::default(),
