@@ -127,6 +127,24 @@ impl<'a> SocketSet<'a> {
         }
     }
 
+    /// Non-panicking counterpart of [`Self::get_mut`]. Returns `None`
+    /// when the slot is empty (the handle has been removed) or the
+    /// socket in the slot is of a different type than `T`.
+    ///
+    /// Use this from application code that holds handles obtained
+    /// outside the per-packet path (e.g. a DPDK transport that tracks
+    /// `(connection_id → handle)` indirection across poll iterations,
+    /// or any callback that runs after an explicit `close` + `remove`).
+    /// `get_mut` itself stays panicking so internal callers that
+    /// *know* a handle is live keep the contract — this helper exists
+    /// for callers that don't have that guarantee.
+    pub fn try_get_mut<T: AnySocket<'a>>(&mut self, handle: SocketHandle) -> Option<&mut T> {
+        self.sockets[handle.0]
+            .inner
+            .as_mut()
+            .and_then(|item| T::downcast_mut(&mut item.socket))
+    }
+
     /// Get a mutable reference to the raw socket enum by its handle.
     ///
     /// Unlike [`get_mut`], this does not downcast to a specific socket type
