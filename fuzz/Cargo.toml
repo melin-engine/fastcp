@@ -1,5 +1,5 @@
 [package]
-name = "smoltcp-fuzz"
+name = "fastcp-fuzz"
 version = "0.0.1"
 authors = ["Automatically generated"]
 publish = false
@@ -12,7 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 getopts = "0.2"
-smoltcp = { path = ".." }
+fastcp = { path = ".." }
 
 # Prevent this from interfering with workspaces
 [workspace]
