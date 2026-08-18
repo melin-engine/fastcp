@@ -162,6 +162,8 @@ pub mod config {
     pub const RPL_RELATIONS_BUFFER_COUNT: usize = 16;
     pub const RPL_PARENTS_BUFFER_COUNT: usize = 8;
     pub const IPV6_HBH_MAX_OPTIONS: usize = 4;
+    // Deliberately far below the shipped default (256): unit tests need to
+    // reach the full-array state cheaply.
     pub const ZERO_COPY_RX_MAX_SEGMENTS: usize = 32;
 }
 
