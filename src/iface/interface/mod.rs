@@ -469,6 +469,25 @@ impl Interface {
         self.fragments.reassembly_timeout = timeout;
     }
 
+    /// Drop any TCP 4-tuple index entries pointing at `handle`.
+    ///
+    /// Call this whenever a TCP socket is removed from the `SocketSet`, before
+    /// or after the removal. The interface indexes established connections for
+    /// O(1) segment demultiplexing, but `SocketSet` removal is invisible to it,
+    /// so without this call a closed connection's entry occupies a slot
+    /// permanently. The table stops accepting inserts at half capacity, so
+    /// after enough connection *lifetimes* every subsequent connection is
+    /// unindexed for its whole life and each of its segments falls back to a
+    /// linear scan over every socket — a slowdown that grows with uptime and
+    /// never recovers.
+    ///
+    /// Calling it for a handle that is not indexed, or is not a TCP socket, is
+    /// a no-op.
+    #[cfg(feature = "socket-tcp")]
+    pub fn forget_tcp_socket(&mut self, handle: crate::iface::SocketHandle) {
+        self.inner.tcp_socket_index.remove_by_handle(handle);
+    }
+
     /// Transmit packets queued in the sockets, and receive packets queued
     /// in the device.
     ///

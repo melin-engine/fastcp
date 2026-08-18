@@ -52,8 +52,17 @@ impl InterfaceInner {
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
             }
-            // Index stale — remove and fall through to linear scan.
-            self.tcp_socket_index.remove_by_handle(handle);
+            // Index stale — remove and fall through to linear scan. Evict the
+            // exact key that just missed, not everything pointing at `handle`:
+            // once `SocketSet` recycles the index, the live connection on that
+            // handle has its own entry, and removing by handle can take the
+            // live one and leave this stale one in place.
+            self.tcp_socket_index.remove(
+                ip_repr.dst_addr(),
+                tcp_repr.dst_port,
+                ip_repr.src_addr(),
+                tcp_repr.src_port,
+            );
         }
 
         // Slow path: linear scan for LISTEN sockets and unindexed connections.
