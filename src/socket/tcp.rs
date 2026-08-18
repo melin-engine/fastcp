@@ -630,6 +630,19 @@ pub struct Socket<'a> {
 
     /// Fixed-capacity array of zero-copy segment descriptors, sorted by stream_offset.
     /// Each entry points into externally-owned frame memory (e.g. DPDK mbufs).
+    ///
+    /// A fixed array rather than a heap collection: the socket is `no_std`-
+    /// friendly and this is on the ingress hot path, so the capacity is a
+    /// compile-time constant (`ZERO_COPY_RX_MAX_SEGMENTS`, tunable by cargo
+    /// feature or `SMOLTCP_` env var) and insertion needs no allocation.
+    ///
+    /// The capacity is a *segment count*, not a byte budget, and that is the
+    /// binding limit for small-segment workloads: an order-entry flow with
+    /// Nagle disabled consumes one slot per ~64-byte packet while the byte
+    /// window still reports tens of KiB free. Sizing therefore follows the
+    /// largest number of segments one socket can receive between two
+    /// application drains — for a DPDK poll loop that is the RX burst size
+    /// times the number of polls per drain cycle.
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
     zc_segments: [ZeroCopySegment; crate::config::ZERO_COPY_RX_MAX_SEGMENTS],
     /// Number of valid entries in `zc_segments`.
@@ -977,12 +990,63 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Upper bound on the advertised window imposed by free zero-copy
+    /// descriptor slots. Returns `usize::MAX` (no bound) when the feature is
+    /// disabled.
+    ///
+    /// `rx_buffer.window()` counts bytes, but the zero-copy path stores one
+    /// descriptor per received segment in a fixed-capacity array. Nothing
+    /// otherwise ties the two together, so a peer can fill the byte window
+    /// with more segments than there are free slots. The overflow is dropped
+    /// without an ACK, and the retransmission resends the whole outstanding
+    /// window — which overflows again. Bounding the window converts that into
+    /// ordinary flow control: the peer simply stops until the application
+    /// drains segments and the window reopens.
+    ///
+    /// The bound is `free slots x MSS` because no segment carries more than
+    /// MSS bytes, so that many bytes always fit. It is a bound for
+    /// MSS-sized segments only — no byte-denominated window can constrain a
+    /// segment *count*, so a flow of small segments can still exhaust the
+    /// array. Sizing `ZERO_COPY_RX_MAX_SEGMENTS` for the workload is what
+    /// covers that case.
+    ///
+    /// `remote_mss` is the peer's advertised MSS (the limit on what we may
+    /// send) rather than the limit on what it may send us; the two are equal
+    /// whenever both ends share an MTU, which is the case this bound targets.
+    /// A peer on a larger MTU makes the bound permissive, never unsafe in a
+    /// new way, since that is today's unconditional behaviour.
+    ///
+    /// Only sockets driven through zero-copy ingress are bounded, identified
+    /// by a registered retain callback: that callback is what keeps a borrowed
+    /// frame alive, so a socket without one cannot hold descriptors. Sockets
+    /// fed through [`process()`] in the same build keep their full byte
+    /// window.
+    #[inline]
+    fn zero_copy_window_limit(&self) -> usize {
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            if self.zc_retain_fn.is_none() {
+                return usize::MAX;
+            }
+            let free = crate::config::ZERO_COPY_RX_MAX_SEGMENTS - self.zc_segment_count;
+            free.saturating_mul(self.remote_mss)
+        }
+        #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
+        {
+            usize::MAX
+        }
+    }
+
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        let window = self.rx_buffer.window().saturating_sub(self.zc_held());
+        let window = self
+            .rx_buffer
+            .window()
+            .saturating_sub(self.zc_held())
+            .min(self.zero_copy_window_limit());
         u16::try_from(window >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
@@ -3177,6 +3241,24 @@ impl<'a> Socket<'a> {
 
         let payload_len = payload.len();
         if payload_len > 0 {
+            // Descriptor capacity is checked before the assembler is touched.
+            // `add_then_remove_front` mutates assembler state, so bailing out
+            // after it would leave the assembler believing these bytes had
+            // arrived while no descriptor holds them — the retransmission
+            // would then be placed at the wrong stream offset. Dropping ahead
+            // of any state change is a clean drop the peer simply retransmits.
+            //
+            // The advertised window is bounded by free slots
+            // (`zero_copy_window_limit`), so a conforming peer should not
+            // reach this; small segments can still get here, since no
+            // byte-denominated window bounds a segment count.
+            if self.zc_segment_count >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
+                // The retain callback was NOT called, so the backing frame is
+                // freed normally by the transport's batch recycle.
+                net_debug!("zero-copy RX descriptor array full, dropping segment");
+                return DataSegmentResult::Dropped;
+            }
+
             let Ok(contig_len) = self
                 .assembler
                 .add_then_remove_front(payload_offset, payload_len)
@@ -3185,14 +3267,6 @@ impl<'a> Socket<'a> {
                 // so the backing frame is freed normally by batch recycle.
                 return DataSegmentResult::Dropped;
             };
-
-            // Store a descriptor instead of copying into rx_buffer.
-            if self.zc_segment_count >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
-                // Array full — drop the segment. The retain callback was
-                // NOT called, so the backing frame will be freed normally
-                // by the transport's batch recycle.
-                return DataSegmentResult::Dropped;
-            }
 
             // Compute absolute stream offset: zc_contiguous_bytes is the
             // "virtual rx_buffer.len()" and payload_offset is relative to the
@@ -10451,6 +10525,11 @@ mod test {
             RELEASED_HANDLES.with(|h| h.borrow_mut().push(handle.bytes));
         }
 
+        /// A real transport bumps the frame refcount here; the tests only need
+        /// the callback to be present, since that is what marks the socket as
+        /// zero-copy driven.
+        fn test_retain_fn(_handle: OpaqueFrameHandle) {}
+
         fn make_handle(id: u8) -> OpaqueFrameHandle {
             let mut bytes = [0u8; 16];
             bytes[0] = id;
@@ -10763,6 +10842,137 @@ mod test {
 
             // No zero-copy segments should be held (RST has no payload).
             assert_eq!(released_handles().len(), 0);
+        }
+
+        /// Feed `count` one-byte segments through the zero-copy batch path,
+        /// starting at `REMOTE_SEQ + 1`, one descriptor slot each.
+        fn fill_slots(s: &mut TestSocket, count: usize) {
+            for i in 0..count {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + i,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"x",
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+        }
+
+        /// A socket whose byte window is far larger than the descriptor array
+        /// can cover, so the slot bound is what binds. 32 slots (the test
+        /// config) x 64 B MSS = 2048, against a 4096-byte receive buffer.
+        fn socket_with_binding_slot_bound() -> TestSocket {
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.socket.set_zero_copy_retain_fn(test_retain_fn);
+            s.socket.remote_mss = 64;
+            s.cx.set_now(Instant::from_millis(0));
+            s
+        }
+
+        #[test]
+        fn window_is_bounded_by_free_zero_copy_slots() {
+            clear_released();
+            let s = socket_with_binding_slot_bound();
+
+            // Not the 4096 bytes the receive buffer has free.
+            assert_eq!(s.socket.scaled_window(), 2048);
+        }
+
+        #[test]
+        fn window_is_unbounded_without_a_retain_callback() {
+            clear_released();
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.remote_mss = 64;
+
+            // Same build, same buffers, but this socket is fed through
+            // `process()` — the slot bound must not throttle it.
+            assert_eq!(s.socket.scaled_window(), 4096);
+        }
+
+        #[test]
+        fn window_tracks_slots_not_just_bytes() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            fill_slots(&mut s, 4);
+
+            // Byte accounting alone would still advertise 4092. Four slots are
+            // gone, so the real capacity is 28 x 64.
+            assert_eq!(s.socket.scaled_window(), 28 * 64);
+        }
+
+        #[test]
+        fn full_descriptor_array_advertises_a_zero_window() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            fill_slots(&mut s, crate::config::ZERO_COPY_RX_MAX_SEGMENTS);
+
+            // The peer is told to stop rather than being left to overrun the
+            // array and have the excess dropped without an ACK.
+            assert_eq!(s.socket.scaled_window(), 0);
+        }
+
+        #[test]
+        fn a_slot_exhausted_drop_leaves_reassembly_state_untouched() {
+            clear_released();
+            const CAP: usize = crate::config::ZERO_COPY_RX_MAX_SEGMENTS;
+
+            // No retain callback, so the window is not slot-bounded and the
+            // peer can overrun the array — the same position a conforming peer
+            // reaches with segments already in flight under an older, wider
+            // window.
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            // Offset 0 never arrives, so nothing becomes contiguous and every
+            // segment keeps its slot; CAP of them fill the array.
+            for i in 1..=CAP {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + i,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"x",
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+            assert_eq!(s.socket.zc_segment_count, CAP);
+
+            let assembler_before = s.socket.assembler.clone();
+
+            // One more segment, extending the range the assembler already
+            // holds so it would be accepted, but with no slot left to hold it.
+            // The drop has to happen before the assembler records the range:
+            // bytes marked received that no descriptor holds would misplace
+            // every later segment once the gap at offset 0 is filled.
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + CAP + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"y",
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, seg, make_handle(0xff))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            assert_eq!(s.socket.zc_segment_count, CAP);
+            assert_eq!(s.socket.assembler, assembler_before);
+        }
+
+        #[test]
+        fn window_reopens_once_segments_are_consumed() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            fill_slots(&mut s, crate::config::ZERO_COPY_RX_MAX_SEGMENTS);
+            assert_eq!(s.socket.scaled_window(), 0);
+
+            while s.socket.recv_zero_copy(|slice| slice.len()).unwrap() != 0 {}
+
+            assert_eq!(s.socket.scaled_window(), 2048);
         }
     }
 }
