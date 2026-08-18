@@ -6,7 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No unreleased changes yet. Please send PRs!
+- iface
+    - Add `Interface::forget_tcp_socket`, which drops the TCP 4-tuple index entries for a socket handle. Without it the index never learns about `SocketSet` removals, so closed connections hold their slots forever and — once the table reaches its insert limit — every subsequent connection stays unindexed for its whole life and falls back to a linear scan per segment.
+    - Evict the exact stale key on an index miss instead of everything sharing the handle, so recycling a slab index can no longer drop the live entry and keep the stale one.
+    - `remove_by_handle` now drains every entry naming the handle rather than the first one found.
+- tcp
+    - Check zero-copy descriptor capacity before adding the segment to the reassembler. Dropping afterwards left the reassembler holding bytes that no descriptor backed, so once the preceding gap was filled the stream advanced over data that was never stored and every later segment was placed at the wrong offset.
+    - Bound the advertised receive window by free zero-copy descriptor slots. Byte-denominated window accounting alone let a peer put more segments in flight than the descriptor array can hold; the excess was dropped without an ACK and the retransmission resent the whole window, overflowing again. Only sockets with a registered retain callback are bounded, so sockets driven through `process()` in a zero-copy build are unaffected.
+    - Raise the default `ZERO_COPY_RX_MAX_SEGMENTS` from 32 to 256, and expose it as `zero-copy-rx-max-segments-N` cargo features alongside the existing `SMOLTCP_ZERO_COPY_RX_MAX_SEGMENTS` env var. The array is a segment count, not a byte budget, so small-frame workloads exhaust it long before the byte window closes; 256 covers several full RX bursts to one socket between application drains, at 40 bytes per slot on sockets that enable `socket-tcp-zero-copy-rx`.
 
 ## [0.13.0] - 2026-03-20
 
