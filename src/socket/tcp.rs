@@ -1021,6 +1021,13 @@ impl<'a> Socket<'a> {
     /// frame alive, so a socket without one cannot hold descriptors. Sockets
     /// fed through [`process()`] in the same build keep their full byte
     /// window.
+    ///
+    /// The count of free slots deliberately includes the slot that
+    /// `process_data_segment_zero_copy` reserves for a segment at the window's
+    /// left edge. Netting that reservation out would return 0 exactly when the
+    /// left edge is missing and the array is otherwise full, which is the
+    /// state the reservation exists to keep the window open through — see the
+    /// reservation's comment there.
     #[inline]
     fn zero_copy_window_limit(&self) -> usize {
         #[cfg(feature = "socket-tcp-zero-copy-rx")]
@@ -3252,7 +3259,22 @@ impl<'a> Socket<'a> {
             // (`zero_copy_window_limit`), so a conforming peer should not
             // reach this; small segments can still get here, since no
             // byte-denominated window bounds a segment count.
-            if self.zc_segment_count >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
+            //
+            // The final slot is reserved for a segment covering the window's
+            // left edge (`payload_offset == 0`). Without that reservation,
+            // out-of-order segments can fill the array while the left edge is
+            // still missing — the ordinary single-loss case. The advertised
+            // window then falls to zero, the peer's retransmission of the
+            // missing segment is refused by the zero-window check, the gap is
+            // never filled, no bytes ever become contiguous,
+            // `recv_zero_copy()` can free nothing, and the connection is
+            // stalled for good. Holding one slot back keeps the window at one
+            // MSS or more for as long as the left edge is missing, so the
+            // retransmission is accepted; arriving at offset 0 it always
+            // advances the contiguous frontier, which lets the application
+            // drain and free slots.
+            let reserved = usize::from(payload_offset != 0);
+            if self.zc_segment_count + reserved >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
                 // The retain callback was NOT called, so the backing frame is
                 // freed normally by the transport's batch recycle.
                 net_debug!("zero-copy RX descriptor array full, dropping segment");
@@ -10929,7 +10951,8 @@ mod test {
             s.cx.set_now(Instant::from_millis(0));
 
             // Offset 0 never arrives, so nothing becomes contiguous and every
-            // segment keeps its slot; CAP of them fill the array.
+            // segment keeps its slot; they fill the array up to the slot held
+            // back for the missing left edge.
             for i in 1..=CAP {
                 let seg = TcpRepr {
                     seq_number: REMOTE_SEQ + 1 + i,
@@ -10940,7 +10963,7 @@ mod test {
                 let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
                 let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
             }
-            assert_eq!(s.socket.zc_segment_count, CAP);
+            assert_eq!(s.socket.zc_segment_count, CAP - 1);
 
             let assembler_before = s.socket.assembler.clone();
 
@@ -10958,8 +10981,56 @@ mod test {
             let segments = [(RECV_IP_TEMPL, seg, make_handle(0xff))];
             let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
 
-            assert_eq!(s.socket.zc_segment_count, CAP);
+            assert_eq!(s.socket.zc_segment_count, CAP - 1);
             assert_eq!(s.socket.assembler, assembler_before);
+        }
+
+        #[test]
+        fn a_left_edge_gap_does_not_deadlock_a_full_descriptor_array() {
+            clear_released();
+            const CAP: usize = crate::config::ZERO_COPY_RX_MAX_SEGMENTS;
+            let mut s = socket_with_binding_slot_bound();
+
+            // The ordinary single-loss case: every segment after the first
+            // byte arrives, so nothing becomes contiguous and each one keeps
+            // its slot.
+            for i in 1..=CAP {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + i,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"x",
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+
+            // One slot is held back for the missing left edge, so the window
+            // stays open instead of collapsing to zero with nothing the
+            // application can drain to reopen it.
+            assert_eq!(s.socket.zc_segment_count, CAP - 1);
+            assert_eq!(s.socket.zc_contiguous_bytes, 0);
+            assert_ne!(s.socket.scaled_window(), 0);
+
+            // The peer retransmits the lost segment; it has to be accepted.
+            let retransmit = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"x",
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, retransmit, make_handle(0xfe))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            // Filling the gap advances the contiguous frontier, which is what
+            // lets the application drain and hand every slot back.
+            assert_eq!(s.socket.zc_segment_count, CAP);
+            assert_eq!(s.socket.zc_contiguous_bytes, CAP);
+
+            while s.socket.recv_zero_copy(|slice| slice.len()).unwrap() != 0 {}
+
+            assert_eq!(s.socket.zc_segment_count, 0);
+            assert_eq!(s.socket.scaled_window(), 2048);
         }
 
         #[test]
