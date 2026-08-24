@@ -35,6 +35,13 @@ FEATURES_TEST=(
     "std,medium-ieee802154,medium-ip,proto-ipv4,socket-raw,auto-icmp-echo-reply"
     "std,medium-ethernet,proto-ipv4,proto-ipsec,socket-raw"
     "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp,proto-ipv6-slaac"
+    # Zero-copy RX. `medium-ip` is what compiles the TCP socket test module,
+    # and `multicast` what compiles the IPv6 interface tests; without them the
+    # combos build but run none of the tests that matter here. IPv4-only and
+    # IPv6-only both appear because the zero-copy paths carry per-protocol cfg.
+    "std,medium-ip,proto-ipv4,socket-tcp,socket-tcp-zero-copy-rx"
+    "std,medium-ethernet,medium-ip,proto-ipv6,multicast,socket-tcp,socket-tcp-zero-copy-rx"
+    "std,medium-ethernet,medium-ip,proto-ipv4,proto-ipv6,multicast,socket-udp,socket-tcp,socket-tcp-zero-copy-rx,async"
 )
 
 FEATURES_CHECK=(
@@ -42,6 +49,12 @@ FEATURES_CHECK=(
     "defmt,medium-ip,medium-ethernet,proto-ipv6,proto-ipv6-slaac,multicast,proto-dhcpv4,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async"
     "defmt,alloc,medium-ip,medium-ethernet,proto-ipv6,proto-ipv6-slaac,multicast,proto-dhcpv4,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async"
     "medium-ieee802154,proto-sixlowpan,socket-dns,auto-icmp-echo-reply"
+    # `cargo test` substitutes the hardcoded test config, which pins
+    # ZERO_COPY_RX_MAX_SEGMENTS to 32, so the shipped default is only ever
+    # compiled by a non-test build. First combo takes the default, second
+    # pins an off-default value to exercise the feature-selected path.
+    "medium-ip,medium-ethernet,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-zero-copy-rx"
+    "medium-ip,proto-ipv4,socket-tcp,socket-tcp-zero-copy-rx,zero-copy-rx-max-segments-1024"
 )
 
 test() {

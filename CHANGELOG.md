@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- ci
+    - Cover `socket-tcp-zero-copy-rx` in the test and check matrices. It is in neither the default feature set nor any prior combo, so nothing in CI compiled the zero-copy paths, let alone ran their tests. The check combos also compile the shipped `ZERO_COPY_RX_MAX_SEGMENTS`, which `cargo test` never sees: the test build substitutes a hardcoded config that pins it to 32.
 - iface
     - Add `Interface::forget_tcp_socket`, which drops the TCP 4-tuple index entries for a socket handle. Without it the index never learns about `SocketSet` removals, so closed connections hold their slots forever and — once the table reaches its insert limit — every subsequent connection stays unindexed for its whole life and falls back to a linear scan per segment.
     - Evict the exact stale key on an index miss instead of everything sharing the handle, so recycling a slab index can no longer drop the live entry and keep the stale one.
