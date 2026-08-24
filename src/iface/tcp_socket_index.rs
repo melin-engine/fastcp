@@ -92,6 +92,12 @@ impl TcpSocketIndex {
         }
     }
 
+    /// Number of live entries. Insertion stops at half of [`CAPACITY`].
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
     /// Look up a socket handle by 4-tuple. Returns `None` if not indexed.
     #[inline]
     pub(crate) fn get(

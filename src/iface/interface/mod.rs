@@ -471,23 +471,28 @@ impl Interface {
 
     /// Drop any TCP 4-tuple index entries pointing at `handle`.
     ///
-    /// Call this whenever a TCP socket is removed from the `SocketSet`, either
-    /// before the removal or after it but before the handle can be reused.
+    /// Call this whenever a connection ends without a segment passing through
+    /// the interface — `SocketSet::remove` of a live connection, `abort()`, or
+    /// a timeout. A connection torn down by an inbound segment (an RST, the
+    /// final ACK of LAST-ACK, the FIN that opens TIME-WAIT) is evicted by the
+    /// interface itself, so the common paths need no call.
+    ///
+    /// The interface indexes established connections for O(1) segment
+    /// demultiplexing, and those entries are what needs reclaiming. The table
+    /// stops accepting inserts at half capacity, so an entry that is never
+    /// evicted costs a slot permanently, and once the slots run out every
+    /// subsequent connection is unindexed for its whole life and each of its
+    /// segments falls back to a linear scan over every socket — a slowdown
+    /// that grows with uptime and never recovers.
+    ///
+    /// When the call does apply, make it either before the `SocketSet`
+    /// removal or after it but before the handle can be reused.
     /// `SocketSet::add` hands out the lowest free slab index, so a removal
     /// followed by an add can return the same handle; if a segment for the new
     /// socket is processed in between, it is indexed under that handle and this
     /// call — which drops *every* entry naming the handle — would take the live
     /// entry down with the stale one. Removing first, or forgetting before any
     /// add, keeps that from happening.
-    ///
-    /// The interface indexes established connections for
-    /// O(1) segment demultiplexing, but `SocketSet` removal is invisible to it,
-    /// so without this call a closed connection's entry occupies a slot
-    /// permanently. The table stops accepting inserts at half capacity, so
-    /// after enough connection *lifetimes* every subsequent connection is
-    /// unindexed for its whole life and each of its segments falls back to a
-    /// linear scan over every socket — a slowdown that grows with uptime and
-    /// never recovers.
     ///
     /// Calling it for a handle that is not indexed, or is not a TCP socket, is
     /// a no-op.

@@ -156,6 +156,136 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
     );
 }
 
+/// Drive one TCP segment through `process_tcp`, discarding any reply.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
+fn feed_tcp(
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    remote_port: u16,
+    control: TcpControl,
+    seq_number: TcpSeqNumber,
+    ack_number: Option<TcpSeqNumber>,
+) {
+    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+
+    let tcp = TcpRepr {
+        src_port: remote_port,
+        dst_port: 4243,
+        control,
+        seq_number,
+        ack_number,
+        window_len: 256,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+
+    let mut tcp_bytes = vec![0u8; tcp.buffer_len()];
+    tcp.emit(
+        &mut TcpPacket::new_unchecked(&mut tcp_bytes),
+        &remote.into(),
+        &local.into(),
+        &ChecksumCapabilities::default(),
+    );
+
+    let _reply = iface.inner.process_tcp(
+        sockets,
+        false,
+        IpRepr::Ipv6(Ipv6Repr {
+            src_addr: remote,
+            dst_addr: local,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        }),
+        &tcp_bytes,
+    );
+}
+
+/// A socket that closes and re-listens — the documented server idiom, which
+/// never removes the socket from the `SocketSet` and so never calls
+/// `forget_tcp_socket` — must not leak an index entry per connection. Each
+/// peer uses a fresh ephemeral port, so nothing ever replays the old 4-tuple
+/// to trigger the stale-entry eviction on the lookup path.
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
+fn tcp_index_reclaims_slots_across_connection_lifetimes() {
+    use crate::socket::tcp;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 64]),
+        tcp::SocketBuffer::new(vec![0; 64]),
+    );
+    let handle = sockets.add(socket);
+    sockets.get_mut::<tcp::Socket>(handle).listen(4243).unwrap();
+
+    // Far more lifetimes than the table has slots. Without eviction the
+    // entries accumulate, inserts start failing, and every later connection
+    // falls back to the linear scan for good.
+    for n in 0..512u16 {
+        let remote_port = 1024 + n;
+        feed_tcp(
+            &mut iface,
+            &mut sockets,
+            remote_port,
+            TcpControl::Syn,
+            TcpSeqNumber(-10001),
+            None,
+        );
+        assert_eq!(
+            sockets.get_mut::<tcp::Socket>(handle).state(),
+            tcp::State::SynReceived,
+            "lifetime {n} should have been accepted"
+        );
+
+        // An RST in SYN-RECEIVED puts the socket back in LISTEN, ready for
+        // the next connection, and drops the 4-tuple it was holding.
+        feed_tcp(
+            &mut iface,
+            &mut sockets,
+            remote_port,
+            TcpControl::Rst,
+            TcpSeqNumber(-10000),
+            Some(TcpSeqNumber(0)),
+        );
+        assert_eq!(
+            sockets.get_mut::<tcp::Socket>(handle).state(),
+            tcp::State::Listen,
+            "lifetime {n} should have been reset"
+        );
+
+        assert_eq!(
+            iface.inner.tcp_socket_index.len(),
+            0,
+            "lifetime {n} left an entry behind"
+        );
+    }
+
+    // The index is still usable rather than permanently full.
+    feed_tcp(
+        &mut iface,
+        &mut sockets,
+        9999,
+        TcpControl::Syn,
+        TcpSeqNumber(-10001),
+        None,
+    );
+    assert_eq!(
+        iface.inner.tcp_socket_index.get(
+            Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into(),
+            4243,
+            Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2).into(),
+            9999,
+        ),
+        Some(handle)
+    );
+}
+
 #[test]
 #[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
 pub fn tcp_not_accepted() {
