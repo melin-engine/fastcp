@@ -3348,8 +3348,74 @@ impl<'a> Socket<'a> {
             batch.assembler_was_empty_at_start = self.assembler.is_empty();
         }
 
-        let payload_len = payload.len();
-        if payload_len > 0 {
+        if !payload.is_empty() {
+            // The window check trimmed the payload against the window's left
+            // edge, which is the contiguous frontier, but nothing trimmed it
+            // against the out-of-order descriptors sitting past that frontier.
+            // A retransmission overlapping one of those — go-back-N, a
+            // spurious RTO resending from `snd_una`, or a peer that
+            // recombined its send queue — would be stored as a second
+            // descriptor covering bytes another descriptor already holds.
+            // `recv_zero_copy` then consumes the front one, stops at the
+            // overlapped offset, and subtracts what it consumed from a
+            // `stream_offset` smaller than that count: a panic in debug, and
+            // in release a wrapped offset that no later segment can ever
+            // match, so the socket delivers nothing again and its frames are
+            // never released.
+            //
+            // Descriptors are kept sorted and non-overlapping, so at most one
+            // holds the incoming range's start and at most one extends past
+            // its end. Trimming against those two leaves a range that either
+            // fills a single gap or is empty, and every descriptor left
+            // inside it is a duplicate to be dropped in the new segment's
+            // favour.
+            //
+            // The two tests are deliberately asymmetric. A descriptor ending
+            // exactly where the incoming range ends is treated as covered
+            // rather than as a tail overlap, so a retransmission that resends
+            // a whole run of held segments supersedes all of them instead of
+            // being trimmed short of the last one. A descriptor starting
+            // exactly where the incoming range starts is treated as a head
+            // overlap, so an exact duplicate is dropped outright rather than
+            // released and re-retained for no gain.
+            let abs_start = self.zc_contiguous_bytes + payload_offset;
+            let abs_end = abs_start + payload.len();
+            let mut trim_start = abs_start;
+            let mut trim_end = abs_end;
+            for i in 0..self.zc_segment_count {
+                let held_start = self.zc_segments[i].stream_offset;
+                let held_end = held_start + self.zc_segments[i].data_len;
+                if held_start <= abs_start && abs_start < held_end {
+                    trim_start = held_end;
+                }
+                if held_start < abs_end && abs_end < held_end {
+                    trim_end = held_start;
+                }
+            }
+
+            if trim_start >= trim_end {
+                // Every byte is already held. The frame is not retained, so
+                // the transport recycles it with the batch, and the segment
+                // still counts as processed so the peer is re-ACKed.
+                batch.segments_processed += 1;
+                return DataSegmentResult::Ok;
+            }
+
+            // Descriptors the stored range will fully cover. Counted here
+            // because they free slots, and so belong in the capacity check
+            // below; they are actually released further down, once every
+            // fallible step has succeeded.
+            let covered = |seg: &ZeroCopySegment| {
+                trim_start <= seg.stream_offset && seg.stream_offset + seg.data_len <= trim_end
+            };
+            let evicted = self.zc_segments[..self.zc_segment_count]
+                .iter()
+                .filter(|seg| covered(seg))
+                .count();
+
+            let payload = &payload[trim_start - abs_start..trim_end - abs_start];
+            let payload_len = payload.len();
+
             // Descriptor capacity is checked before the assembler is touched.
             // `add_then_remove_front` mutates assembler state, so bailing out
             // after it would leave the assembler believing these bytes had
@@ -3375,27 +3441,58 @@ impl<'a> Socket<'a> {
             // retransmission is accepted; arriving at offset 0 it always
             // advances the contiguous frontier, which lets the application
             // drain and free slots.
-            let reserved = usize::from(payload_offset != 0);
-            if self.zc_segment_count + reserved >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
+            let reserved = usize::from(trim_start != self.zc_contiguous_bytes);
+            if self.zc_segment_count - evicted + reserved
+                >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS
+            {
                 // The retain callback was NOT called, so the backing frame is
                 // freed normally by the transport's batch recycle.
                 net_debug!("zero-copy RX descriptor array full, dropping segment");
                 return DataSegmentResult::Dropped;
             }
 
+            // The assembler is given the segment's original range, not the
+            // trimmed one: it tracks which bytes have arrived, and the bytes
+            // trimmed off had arrived earlier in the descriptors that still
+            // hold them. Adding either range yields the same set, and the
+            // original keeps `contig_len` identical to what a non-overlapping
+            // segment of the same extent would have produced.
             let Ok(contig_len) = self
                 .assembler
-                .add_then_remove_front(payload_offset, payload_len)
+                .add_then_remove_front(payload_offset, abs_end - abs_start)
             else {
                 // Assembler full — drop the segment. Retain was not called,
                 // so the backing frame is freed normally by batch recycle.
                 return DataSegmentResult::Dropped;
             };
 
-            // Compute absolute stream offset: zc_contiguous_bytes is the
-            // "virtual rx_buffer.len()" and payload_offset is relative to the
-            // current window start, so their sum gives the absolute position.
-            let abs_offset = self.zc_contiguous_bytes + payload_offset;
+            // Release the descriptors the stored range supersedes. Every
+            // fallible step is behind us, so the array and the assembler stay
+            // in agreement. None of them can be part of the contiguous front:
+            // `trim_start` is at or past the frontier, and so is every offset
+            // at or past `trim_start`.
+            if evicted > 0 {
+                let mut write = 0;
+                for read in 0..self.zc_segment_count {
+                    let held = self.zc_segments[read];
+                    if covered(&held) {
+                        if let Some(release_fn) = self.zc_release_fn {
+                            release_fn(held.frame_handle);
+                        }
+                        self.zc_held_bytes -= held.data_len;
+                        continue;
+                    }
+                    self.zc_segments[write] = held;
+                    write += 1;
+                }
+                debug_assert_eq!(write, self.zc_segment_count - evicted);
+                self.zc_segment_count = write;
+            }
+
+            // The absolute stream offset of the bytes actually stored:
+            // `zc_contiguous_bytes` is the "virtual rx_buffer.len()" and
+            // `trim_start` is already measured from the same origin.
+            let abs_offset = trim_start;
 
             let seg = ZeroCopySegment {
                 data_ptr: payload.as_ptr(),
@@ -11247,6 +11344,193 @@ mod test {
             recv(&mut s, Instant::from_millis(0), |repr| {
                 assert!(repr.unwrap().window_len > 0);
             });
+        }
+
+        /// Feed one segment through the zero-copy batch path.
+        fn feed(s: &mut TestSocket, offset: usize, payload: &[u8], handle: u8) {
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + offset,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload,
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, seg, make_handle(handle))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+        }
+
+        /// The descriptor array must stay sorted, non-overlapping, and in
+        /// agreement with the two byte counters.
+        fn assert_descriptors_tile(s: &TestSocket) {
+            let mut expected = 0;
+            let mut held = 0;
+            for i in 0..s.socket.zc_segment_count {
+                let seg = &s.socket.zc_segments[i];
+                assert!(
+                    seg.stream_offset >= expected,
+                    "descriptor {i} at {} overlaps or precedes {expected}",
+                    seg.stream_offset
+                );
+                expected = seg.stream_offset + seg.data_len;
+                held += seg.data_len;
+            }
+            assert_eq!(held, s.socket.zc_held_bytes, "held bytes");
+            assert!(s.socket.zc_contiguous_bytes <= held, "contiguous vs held");
+        }
+
+        #[test]
+        fn a_gap_filling_retransmit_that_overlaps_held_segments_is_reconciled() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // The left edge is missing and three one-byte segments are held.
+            for i in 1..=3usize {
+                feed(&mut s, i, b"x", i as u8);
+            }
+            assert_eq!(s.socket.zc_segment_count, 3);
+
+            // Go-back-N: the retransmission resends from the left edge and
+            // covers everything already held.
+            feed(&mut s, 0, b"abcd", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_contiguous_bytes, 4);
+
+            // The superseded descriptors are handed back rather than leaked.
+            assert_eq!(released_handles().len(), 3);
+
+            let mut seen = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(consumed, 4);
+            assert_eq!(seen.len(), 4);
+            assert_eq!(s.socket.zc_segment_count, 0);
+            assert_eq!(s.socket.zc_held_bytes, 0);
+        }
+
+        #[test]
+        fn a_retransmit_overlapping_only_the_tail_of_a_gap_is_trimmed() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // A hole at [0, 4) with a four-byte segment behind it.
+            feed(&mut s, 4, b"wxyz", 4);
+            assert_eq!(s.socket.zc_segment_count, 1);
+
+            // A retransmission spanning the hole and the first two bytes of
+            // the held segment. Neither covers the other, so the new one is
+            // trimmed and both are kept.
+            feed(&mut s, 0, b"abcdef", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_segment_count, 2);
+            assert_eq!(s.socket.zc_segments[0].data_len, 4);
+            assert_eq!(s.socket.zc_contiguous_bytes, 8);
+            assert_eq!(released_handles().len(), 0);
+
+            let mut seen = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(consumed, 8);
+            assert_eq!(&seen, b"abcdwxyz");
+        }
+
+        #[test]
+        fn a_retransmit_overlapping_only_the_head_of_a_gap_is_trimmed() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // A hole at [0, 2) keeps the held segment off the contiguous
+            // frontier, so the window check leaves the incoming payload alone
+            // and the overlap is the descriptor array's to resolve.
+            feed(&mut s, 2, b"cdef", 2);
+            assert_eq!(s.socket.zc_contiguous_bytes, 0);
+
+            // A retransmission starting inside the held segment and running
+            // past its end keeps the held bytes and stores only the new tail.
+            feed(&mut s, 4, b"efgh", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_segment_count, 2);
+            assert_eq!(s.socket.zc_segments[1].stream_offset, 6);
+            assert_eq!(s.socket.zc_segments[1].data_len, 2);
+            assert_eq!(released_handles().len(), 0);
+
+            // Filling the hole makes the whole run contiguous and readable.
+            feed(&mut s, 0, b"ab", 0);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_contiguous_bytes, 8);
+
+            let mut seen = Vec::new();
+            s.socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(&seen, b"abcdefgh");
+        }
+
+        #[test]
+        fn an_exact_duplicate_of_a_held_segment_is_dropped() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            feed(&mut s, 1, b"xy", 1);
+            feed(&mut s, 1, b"xy", 0x40);
+
+            // No second descriptor, and the duplicate's frame is left to the
+            // transport's batch recycle rather than retained or released.
+            assert_eq!(s.socket.zc_segment_count, 1);
+            assert_eq!(s.socket.zc_held_bytes, 2);
+            assert_eq!(released_handles().len(), 0);
+            assert_descriptors_tile(&s);
+        }
+
+        #[test]
+        fn a_retransmit_contained_in_a_held_segment_is_dropped() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            feed(&mut s, 1, b"vwxyz", 1);
+            feed(&mut s, 2, b"wx", 0x40);
+
+            assert_eq!(s.socket.zc_segment_count, 1);
+            assert_eq!(s.socket.zc_held_bytes, 5);
+            assert_descriptors_tile(&s);
+        }
+
+        #[test]
+        fn a_retransmit_spanning_several_held_segments_supersedes_them_all() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // Two out-of-order islands with holes on either side of them.
+            feed(&mut s, 2, b"cd", 2);
+            feed(&mut s, 6, b"gh", 6);
+            assert_eq!(s.socket.zc_segment_count, 2);
+
+            // One retransmission covering both islands and every hole.
+            feed(&mut s, 0, b"abcdefghij", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_segment_count, 1);
+            assert_eq!(s.socket.zc_contiguous_bytes, 10);
+            assert_eq!(released_handles().len(), 2);
+
+            let mut seen = Vec::new();
+            s.socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(&seen, b"abcdefghij");
         }
 
         #[test]
