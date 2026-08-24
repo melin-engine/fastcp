@@ -147,7 +147,7 @@ impl TcpSocketIndex {
         for _ in 0..CAPACITY {
             match &self.slots[idx] {
                 Slot::Empty => {
-                    if self.len >= CAPACITY / 2 {
+                    if self.len() >= CAPACITY / 2 {
                         // Keep load factor below 50% for performance.
                         return false;
                     }
@@ -232,15 +232,10 @@ impl TcpSocketIndex {
         // Restarting after each removal is the simple correct answer; this runs
         // on socket close, not on the packet path.
         loop {
-            let mut found = None;
-            for slot in self.slots.iter() {
-                if let Slot::Occupied(key, h) = slot
-                    && *h == handle
-                {
-                    found = Some(*key);
-                    break;
-                }
-            }
+            let found = self.slots.iter().find_map(|slot| match slot {
+                Slot::Occupied(key, h) if *h == handle => Some(*key),
+                _ => None,
+            });
             let Some(key) = found else { return };
             self.remove(
                 key.local_addr,

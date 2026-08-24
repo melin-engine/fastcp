@@ -1129,16 +1129,7 @@ impl<'a> Socket<'a> {
             // as long as the buffer every advertisement was computed against
             // is still the one in place.
             let byte_edge = self.remote_seq_no + self.rx_buffer.capacity();
-            let max_edge = if max_edge > byte_edge {
-                byte_edge
-            } else {
-                max_edge
-            };
-            if max_edge > last_edge {
-                max_edge
-            } else {
-                last_edge
-            }
+            max_edge.min(byte_edge).max(last_edge)
         }
         #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
         last_edge
@@ -3436,11 +3427,17 @@ impl<'a> Socket<'a> {
             // missing segment is refused by the zero-window check, the gap is
             // never filled, no bytes ever become contiguous,
             // `recv_zero_copy()` can free nothing, and the connection is
-            // stalled for good. Holding one slot back keeps the window at one
-            // MSS or more for as long as the left edge is missing, so the
-            // retransmission is accepted; arriving at offset 0 it always
-            // advances the contiguous frontier, which lets the application
-            // drain and free slots.
+            // stalled for good. Holding one slot back keeps the window open
+            // for as long as the left edge is missing, so the retransmission
+            // is accepted; arriving at offset 0 it always advances the
+            // contiguous frontier, which lets the application drain and free
+            // slots.
+            //
+            // The window that survives is one MSS rounded down to the window
+            // scale granularity, so a peer sending full-MSS segments may have
+            // to split the retransmission and spend a second slot on the
+            // remainder. That still makes progress, which is all the
+            // reservation has to guarantee.
             let reserved = usize::from(trim_start != self.zc_contiguous_bytes);
             if self.zc_segment_count - evicted + reserved
                 >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS
@@ -11211,7 +11208,7 @@ mod test {
             // bytes marked received that no descriptor holds would misplace
             // every later segment once the gap at offset 0 is filled.
             let seg = TcpRepr {
-                seq_number: REMOTE_SEQ + 1 + CAP + 1,
+                seq_number: REMOTE_SEQ + 1 + CAP,
                 ack_number: Some(LOCAL_SEQ + 1),
                 payload: b"y",
                 ..SEND_TEMPL
@@ -11541,9 +11538,22 @@ mod test {
             fill_slots(&mut s, crate::config::ZERO_COPY_RX_MAX_SEGMENTS);
             assert_eq!(s.socket.scaled_window(), 0);
 
+            // Actually tell the peer to stop, rather than only computing that
+            // it should: reopening is only observable against an
+            // advertisement that went out.
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert_eq!(repr.unwrap().window_len, 0);
+            });
+
             while s.socket.recv_zero_copy(|slice| slice.len()).unwrap() != 0 {}
 
             assert_eq!(s.socket.scaled_window(), 2048);
+            // And the reopening is worth nothing until the peer is told, so
+            // the socket must consider the update worth sending.
+            assert!(s.socket.window_to_update());
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert_eq!(repr.unwrap().window_len, 2048);
+            });
         }
     }
 }
