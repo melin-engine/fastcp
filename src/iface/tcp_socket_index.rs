@@ -246,30 +246,42 @@ impl TcpSocketIndex {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "proto-ipv4", feature = "proto-ipv6")))]
 mod test {
     use super::*;
 
+    // The index is protocol-agnostic, but `IpAddress::v4` only exists under
+    // `proto-ipv4` and `IpAddress::v6` only under `proto-ipv6`, so the
+    // addresses are built through helpers that follow whichever is enabled.
+    // Every feature combination that compiles this module has at least one.
+    #[cfg(feature = "proto-ipv4")]
     const LOCAL: IpAddress = IpAddress::v4(10, 0, 0, 1);
+    #[cfg(not(feature = "proto-ipv4"))]
+    const LOCAL: IpAddress = IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+
+    /// A distinct remote address per 256 values of `n`.
+    #[cfg(feature = "proto-ipv4")]
+    const fn remote_nth(n: usize) -> IpAddress {
+        IpAddress::v4(10, 0, 1, (n / 256) as u8)
+    }
+    #[cfg(not(feature = "proto-ipv4"))]
+    const fn remote_nth(n: usize) -> IpAddress {
+        IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 1, (n / 256) as u16)
+    }
 
     /// A distinct 4-tuple per `n`, all sharing the local endpoint.
     fn insert_nth(index: &mut TcpSocketIndex, n: usize, handle: usize) -> bool {
         index.insert(
             LOCAL,
             80,
-            IpAddress::v4(10, 0, 1, (n / 256) as u8),
+            remote_nth(n),
             (n % 256) as u16 + 1024,
             SocketHandle::from_index(handle),
         )
     }
 
     fn get_nth(index: &TcpSocketIndex, n: usize) -> Option<SocketHandle> {
-        index.get(
-            LOCAL,
-            80,
-            IpAddress::v4(10, 0, 1, (n / 256) as u8),
-            (n % 256) as u16 + 1024,
-        )
+        index.get(LOCAL, 80, remote_nth(n), (n % 256) as u16 + 1024)
     }
 
     #[test]
