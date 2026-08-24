@@ -471,8 +471,16 @@ impl Interface {
 
     /// Drop any TCP 4-tuple index entries pointing at `handle`.
     ///
-    /// Call this whenever a TCP socket is removed from the `SocketSet`, before
-    /// or after the removal. The interface indexes established connections for
+    /// Call this whenever a TCP socket is removed from the `SocketSet`, either
+    /// before the removal or after it but before the handle can be reused.
+    /// `SocketSet::add` hands out the lowest free slab index, so a removal
+    /// followed by an add can return the same handle; if a segment for the new
+    /// socket is processed in between, it is indexed under that handle and this
+    /// call — which drops *every* entry naming the handle — would take the live
+    /// entry down with the stale one. Removing first, or forgetting before any
+    /// add, keeps that from happening.
+    ///
+    /// The interface indexes established connections for
     /// O(1) segment demultiplexing, but `SocketSet` removal is invisible to it,
     /// so without this call a closed connection's entry occupies a slot
     /// permanently. The table stops accepting inserts at half capacity, so
