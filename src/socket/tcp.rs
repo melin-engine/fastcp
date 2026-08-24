@@ -660,6 +660,14 @@ pub struct Socket<'a> {
     /// Callback for retaining frames when the socket stores a zero-copy segment.
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
     zc_retain_fn: Option<FrameRetainFn>,
+    /// The furthest right edge (`remote_last_ack + remote_last_win`) ever
+    /// advertised, which is not necessarily the most recent one — see
+    /// [`Self::acceptance_window_end`].
+    ///
+    /// `Option` rather than a bare sequence number because there is no edge to
+    /// speak of before the first advertisement, matching `remote_last_ack`.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_max_win_edge: Option<TcpSeqNumber>,
 
     /// Maximum data segments this socket may dispatch in a single
     /// `dispatch_burst` call (i.e. one egress pass over the socket
@@ -712,6 +720,21 @@ enum DataSegmentResult {
     Reply(Option<(IpRepr, TcpRepr<'static>)>),
     /// Segment was dropped (unacceptable, assembler full). Continue.
     Dropped,
+}
+
+/// The right edge implied by advertising `window_len` alongside an ACK of
+/// `last_ack`, or `None` before the first advertisement.
+///
+/// A free function rather than a method so it can be used where `self` is
+/// already immutably borrowed by the segment being emitted.
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+#[inline]
+fn advertised_edge(
+    last_ack: Option<TcpSeqNumber>,
+    window_len: u16,
+    win_shift: u8,
+) -> Option<TcpSeqNumber> {
+    Some(last_ack? + ((window_len as usize) << win_shift))
 }
 
 impl<'a> Socket<'a> {
@@ -790,6 +813,8 @@ impl<'a> Socket<'a> {
             zc_release_fn: None,
             #[cfg(feature = "socket-tcp-zero-copy-rx")]
             zc_retain_fn: None,
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_max_win_edge: None,
         }
     }
 
@@ -1061,6 +1086,64 @@ impl<'a> Socket<'a> {
         u16::try_from(window >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
+    /// Return the right edge of the window the peer may legitimately have sent
+    /// into, given `window_start` as the left edge.
+    ///
+    /// Byte accounting keeps the advertised right edge monotone: the window
+    /// shrinks by exactly what the ACK advances, so `remote_last_ack +
+    /// remote_last_win` is always `remote_seq_no + rx_buffer.capacity()` and
+    /// the most recent advertisement is also the furthest one. The zero-copy
+    /// slot bound breaks that. Every segment costs a whole descriptor slot
+    /// however few bytes it carried, so `free slots x MSS` falls faster than
+    /// the ACK advances — four 1-byte segments against 32 slots and a 64-byte
+    /// MSS retract the edge by 252 bytes.
+    ///
+    /// Retracting the *advertisement* is the point of the bound, and RFC 1122
+    /// section 4.2.2.16 permits it (senders must be robust against a shrinking
+    /// window). Retracting *acceptance* is a different matter: data the peer
+    /// put in flight under the wider advertisement is legitimate, and treating
+    /// it as out-of-window draws a `challenge_ack_reply`, which is rate-limited
+    /// to one per second — a stall rather than a retransmit. So acceptance
+    /// tracks the furthest edge ever advertised while the advertisement itself
+    /// stays free to shrink.
+    ///
+    /// This never admits data the receive buffer cannot hold: every advertised
+    /// window was already `min(byte window, slot bound) <= byte window`, and
+    /// the byte-accounting edge is exactly `remote_seq_no +
+    /// rx_buffer.capacity()`, which only moves forward.
+    #[inline]
+    fn acceptance_window_end(&self, window_start: TcpSeqNumber) -> TcpSeqNumber {
+        let Some(last_ack) = self.remote_last_ack else {
+            return window_start;
+        };
+        let last_edge = last_ack + ((self.remote_last_win as usize) << self.remote_win_shift);
+
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            let Some(max_edge) = self.zc_max_win_edge else {
+                return last_edge;
+            };
+            // Never admit more than the receive buffer can hold, whatever was
+            // advertised earlier. The byte-accounting edge sits at exactly
+            // `remote_seq_no + rx_buffer.capacity()`, so this clamp is inert
+            // as long as the buffer every advertisement was computed against
+            // is still the one in place.
+            let byte_edge = self.remote_seq_no + self.rx_buffer.capacity();
+            let max_edge = if max_edge > byte_edge {
+                byte_edge
+            } else {
+                max_edge
+            };
+            if max_edge > last_edge {
+                max_edge
+            } else {
+                last_edge
+            }
+        }
+        #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
+        last_edge
+    }
+
     /// Return the last window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
@@ -1271,6 +1354,10 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            self.zc_max_win_edge = None;
+        }
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1952,6 +2039,17 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
+        // Keep the furthest advertised edge, so acceptance stays put when the
+        // slot bound retracts the window — see `acceptance_window_end`.
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        if let Some(edge) = advertised_edge(
+            self.remote_last_ack,
+            self.remote_last_win,
+            self.remote_win_shift,
+        ) && self.zc_max_win_edge.is_none_or(|max_edge| edge > max_edge)
+        {
+            self.zc_max_win_edge = Some(edge);
+        }
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -2162,11 +2260,7 @@ impl<'a> Socket<'a> {
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
-        } else {
-            window_start
-        };
+        let window_end = self.acceptance_window_end(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -2829,11 +2923,7 @@ impl<'a> Socket<'a> {
 
         // --- Window/sequence validation ---
         let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
-        } else {
-            window_start
-        };
+        let window_end = self.acceptance_window_end(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -3169,11 +3259,7 @@ impl<'a> Socket<'a> {
 
         // --- Window/sequence validation ---
         let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
-        } else {
-            window_start
-        };
+        let window_end = self.acceptance_window_end(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -3873,6 +3959,17 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = repr.seq_number + repr.segment_len();
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
+        // Keep the furthest advertised edge, so acceptance stays put when the
+        // slot bound retracts the window — see `acceptance_window_end`.
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        if let Some(edge) = advertised_edge(
+            self.remote_last_ack,
+            self.remote_last_win,
+            self.remote_win_shift,
+        ) && self.zc_max_win_edge.is_none_or(|max_edge| edge > max_edge)
+        {
+            self.zc_max_win_edge = Some(edge);
+        }
 
         if repr.segment_len() > 0 {
             self.rtte
@@ -4277,6 +4374,13 @@ mod test {
         s.remote_last_seq = LOCAL_SEQ + 1;
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
         s.remote_last_win = s.scaled_window();
+        // The handshake's advertisement is faked by assigning the fields
+        // directly, so record its right edge the way `dispatch` would have.
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            s.zc_max_win_edge =
+                advertised_edge(s.remote_last_ack, s.remote_last_win, s.remote_win_shift);
+        }
         s
     }
 
@@ -10893,6 +10997,14 @@ mod test {
             s.socket.set_zero_copy_release_fn(test_release_fn);
             s.socket.set_zero_copy_retain_fn(test_retain_fn);
             s.socket.remote_mss = 64;
+            // The callbacks and the MSS land after `socket_established*` has
+            // faked the handshake advertisement, so redo it under the bound.
+            s.socket.remote_last_win = s.socket.scaled_window();
+            s.socket.zc_max_win_edge = advertised_edge(
+                s.socket.remote_last_ack,
+                s.socket.remote_last_win,
+                s.socket.remote_win_shift,
+            );
             s.cx.set_now(Instant::from_millis(0));
             s
         }
@@ -11048,6 +11160,41 @@ mod test {
 
             assert_eq!(s.socket.zc_segment_count, 0);
             assert_eq!(s.socket.scaled_window(), 2048);
+        }
+
+        #[test]
+        fn a_retracted_window_still_accepts_data_sent_under_the_old_edge() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // The edge the peer has already been cleared to send up to.
+            let old_end = s.socket.zc_max_win_edge.unwrap();
+            assert_eq!(old_end, REMOTE_SEQ + 1 + 2048);
+
+            // Four 1-byte segments cost four slots but advance the ACK by only
+            // four bytes, so the next advertisement retracts the right edge by
+            // 4 x (64 - 1) bytes.
+            fill_slots(&mut s, 4);
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert_eq!(repr.unwrap().window_len, 28 * 64);
+            });
+            let new_end = s.socket.remote_last_ack.unwrap() + (s.socket.remote_last_win as usize);
+            assert_eq!(new_end, old_end - 252);
+
+            // A segment the peer put in flight under the old advertisement,
+            // landing past the retracted edge. It is legitimate data, so it
+            // has to be taken rather than answered with a challenge ACK --
+            // those are rate-limited to one per second.
+            let seg = TcpRepr {
+                seq_number: new_end + 8,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"z",
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, seg, make_handle(0xfd))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            assert_eq!(s.socket.zc_segment_count, 5);
         }
 
         #[test]
