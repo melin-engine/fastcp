@@ -1017,10 +1017,14 @@ impl<'a> Socket<'a> {
     /// new way, since that is today's unconditional behaviour.
     ///
     /// Only sockets driven through zero-copy ingress are bounded, identified
-    /// by a registered retain callback: that callback is what keeps a borrowed
-    /// frame alive, so a socket without one cannot hold descriptors. Sockets
-    /// fed through [`process()`] in the same build keep their full byte
-    /// window.
+    /// by a registered release callback. Release is the callback that path
+    /// cannot work without — [`recv_zero_copy()`](Self::recv_zero_copy) has no
+    /// way to hand a frame back without it — whereas retain is optional, for
+    /// transports whose frames already outlive the ingress batch. Descriptors
+    /// are stored either way, so keying the bound on retain would leave a
+    /// release-only transport with an unbounded window, which is the case the
+    /// bound exists for. Sockets fed through [`process()`] in the same build
+    /// register neither callback and keep their full byte window.
     ///
     /// The count of free slots deliberately includes the slot that
     /// `process_data_segment_zero_copy` reserves for a segment at the window's
@@ -1032,7 +1036,7 @@ impl<'a> Socket<'a> {
     fn zero_copy_window_limit(&self) -> usize {
         #[cfg(feature = "socket-tcp-zero-copy-rx")]
         {
-            if self.zc_retain_fn.is_none() {
+            if self.zc_release_fn.is_none() {
                 return usize::MAX;
             }
             let free = crate::config::ZERO_COPY_RX_MAX_SEGMENTS - self.zc_segment_count;
@@ -10903,7 +10907,7 @@ mod test {
         }
 
         #[test]
-        fn window_is_unbounded_without_a_retain_callback() {
+        fn window_is_unbounded_without_zero_copy_callbacks() {
             clear_released();
             let mut s = socket_established_with_buffer_sizes(64, 4096);
             s.socket.remote_mss = 64;
@@ -10911,6 +10915,19 @@ mod test {
             // Same build, same buffers, but this socket is fed through
             // `process()` — the slot bound must not throttle it.
             assert_eq!(s.socket.scaled_window(), 4096);
+        }
+
+        #[test]
+        fn window_is_bounded_with_release_only() {
+            clear_released();
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.socket.remote_mss = 64;
+
+            // Retain is optional — a transport whose frames outlive the
+            // ingress batch registers release alone — but descriptors are
+            // stored either way, so the bound has to apply.
+            assert_eq!(s.socket.scaled_window(), 2048);
         }
 
         #[test]
@@ -10942,10 +10959,10 @@ mod test {
             clear_released();
             const CAP: usize = crate::config::ZERO_COPY_RX_MAX_SEGMENTS;
 
-            // No retain callback, so the window is not slot-bounded and the
-            // peer can overrun the array — the same position a conforming peer
-            // reaches with segments already in flight under an older, wider
-            // window.
+            // Segments are fed in directly rather than through an
+            // advertisement, so the array is overrun regardless of the window
+            // — the same position a conforming peer reaches with segments
+            // already in flight under an older, wider window.
             let mut s = socket_established_with_buffer_sizes(64, 4096);
             s.socket.set_zero_copy_release_fn(test_release_fn);
             s.cx.set_now(Instant::from_millis(0));
