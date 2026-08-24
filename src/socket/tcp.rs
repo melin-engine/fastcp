@@ -1152,13 +1152,25 @@ impl<'a> Socket<'a> {
     /// since the last window update and adjust the window length accordingly. This ensures a fair
     /// comparison between the last window length and the new window length we're going to
     /// advertise.
+    ///
+    /// More can arrive than the last advertisement covered, in which case the
+    /// remainder is zero: everything advertised has been consumed and then
+    /// some. That happens whenever acceptance reaches past the last advertised
+    /// edge — see [`Self::acceptance_window_end`] — and the subtraction has to
+    /// saturate, because `TcpSeqNumber - TcpSeqNumber` panics on underflow in
+    /// every build, not just debug ones.
     #[inline]
     fn last_scaled_window(&self) -> Option<u16> {
         let last_ack = self.remote_last_ack?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let last_edge = last_ack + last_win;
+        let last_win_adjusted = if next_ack > last_edge {
+            0
+        } else {
+            last_edge - next_ack
+        };
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -11195,6 +11207,46 @@ mod test {
             let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
 
             assert_eq!(s.socket.zc_segment_count, 5);
+        }
+
+        #[test]
+        fn arrivals_past_the_retracted_edge_do_not_underflow_the_last_window() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // Retract the advertised edge by 4 x (64 - 1) bytes, then let the
+            // application drain so the slots are free again.
+            fill_slots(&mut s, 4);
+            recv(&mut s, Instant::from_millis(0), |_| {});
+            assert_eq!(s.socket.recv_zero_copy(|b| b.len()).unwrap(), 4);
+
+            // A run of full-MSS segments the peer had in flight under the old
+            // edge. They are accepted, so the ACK frontier advances past the
+            // edge that was last advertised -- `last_scaled_window` is then
+            // asked for a remainder that does not exist.
+            const MSS: [u8; 64] = [b'q'; 64];
+            for i in 0..29usize {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + 4 + i * 64,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &MSS,
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+            assert_eq!(s.socket.zc_contiguous_bytes, 29 * 64);
+
+            // Nothing of the last advertisement is left, and the peer is owed
+            // the update saying so. Both of these panicked before the
+            // saturating subtraction, as did `poll_at` and `dispatch` below.
+            assert_eq!(s.socket.last_scaled_window(), Some(0));
+            assert!(s.socket.window_to_update());
+
+            let _at = s.socket.poll_at(&mut s.cx);
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert!(repr.unwrap().window_len > 0);
+            });
         }
 
         #[test]
