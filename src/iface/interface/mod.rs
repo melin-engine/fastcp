@@ -156,11 +156,29 @@ pub struct InterfaceInner {
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
 
-    /// One-element cache for hardware address resolution. Avoids repeated
-    /// route() + neighbor_cache.lookup() calls within dispatch_burst() where
-    /// all segments go to the same destination.
+    /// One-element cache for hardware address resolution, valid only at the
+    /// instant it was resolved. Avoids repeated route() +
+    /// neighbor_cache.lookup() calls within dispatch_burst(), where every
+    /// segment goes to the same destination and the whole burst is dispatched
+    /// at one timestamp.
+    ///
+    /// The timestamp is part of the key rather than a separate expiry check,
+    /// which makes the entry self-invalidating: `now` is re-stamped at every
+    /// entry point into the interface, so a cached address cannot survive into
+    /// a later poll by any path. That matters because the underlying
+    /// `neighbor_cache.lookup()` takes `now` and enforces the 60 s entry
+    /// lifetime itself — a hit here skips that check entirely, so the two must
+    /// be pinned to the same instant or the cache outlives the entry it
+    /// mirrors.
+    ///
+    /// Within a single instant the only thing that can change the answer is a
+    /// mutation of the neighbor cache, and both mutations that can change a
+    /// `Found` answer clear this: see [`Self::fill_neighbor_cache`] and
+    /// [`Self::flush_neighbor_cache`]. `limit_rate` cannot, since it only
+    /// moves `NotFound` to `RateLimited` and neither is cached, and
+    /// `reset_expiry_if_existing` only extends an entry that keeps its address.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    cached_hardware_addr: Option<(IpAddress, HardwareAddress)>,
+    cached_hardware_addr: Option<(Instant, IpAddress, HardwareAddress)>,
 
     /// O(1) lookup index for established TCP connections.
     /// Maps 4-tuple → SocketHandle, avoiding the O(N) socket scan per packet.
@@ -1267,8 +1285,10 @@ impl InterfaceInner {
     {
         // Fast path: check the one-element cache. This avoids route() +
         // neighbor_cache.lookup() for consecutive packets to the same
-        // destination (common in dispatch_burst).
-        if let Some((cached_ip, cached_hw)) = &self.cached_hardware_addr
+        // destination (common in dispatch_burst). The instant is part of the
+        // match, so the entry cannot outlive the neighbor entry behind it.
+        if let Some((cached_at, cached_ip, cached_hw)) = &self.cached_hardware_addr
+            && *cached_at == self.now
             && cached_ip == dst_addr
         {
             return Ok((*cached_hw, tx_token));
@@ -1337,7 +1357,7 @@ impl InterfaceInner {
 
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
             NeighborAnswer::Found(hardware_addr) => {
-                self.cached_hardware_addr = Some((original_dst, hardware_addr));
+                self.cached_hardware_addr = Some((self.now, original_dst, hardware_addr));
                 return Ok((hardware_addr, tx_token));
             }
             NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
@@ -1414,6 +1434,28 @@ impl InterfaceInner {
         // The request got dispatched, limit the rate on the cache.
         self.neighbor_cache.limit_rate(self.now);
         Err(DispatchError::NeighborPending)
+    }
+
+    /// Record a neighbor mapping, dropping the one-element dispatch cache that
+    /// mirrors it.
+    ///
+    /// Use this rather than `neighbor_cache.fill` directly. A fill can replace
+    /// a neighbor's hardware address — a peer failing over to another NIC, or
+    /// an unsolicited ARP moving an address — and, when the map is full, can
+    /// evict some other entry to make room. Either way an address the dispatch
+    /// cache is holding may no longer be the one a lookup would return, and it
+    /// would otherwise keep handing out the superseded address for the rest of
+    /// the instant.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    fn fill_neighbor_cache(
+        &mut self,
+        protocol_addr: IpAddress,
+        hardware_addr: HardwareAddress,
+        timestamp: Instant,
+    ) {
+        self.neighbor_cache
+            .fill(protocol_addr, hardware_addr, timestamp);
+        self.cached_hardware_addr = None;
     }
 
     fn flush_neighbor_cache(&mut self) {

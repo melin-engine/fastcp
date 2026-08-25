@@ -1548,3 +1548,125 @@ fn test_ipv4_fragment_size() {
         );
     }
 }
+
+/// The one-element hardware address cache must actually serve repeat lookups,
+/// which is its whole reason for existing: a burst of segments to one peer
+/// should resolve the address once.
+///
+/// Observed by flushing the neighbor cache out from under it — through the
+/// bare `neighbor_cache`, not [`InterfaceInner::flush_neighbor_cache`], which
+/// would deliberately drop this cache too. Only a live cache can still answer.
+#[rstest]
+#[case(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+fn hardware_addr_cache_serves_repeat_lookups_within_an_instant(#[case] medium: Medium) {
+    let (mut iface, _sockets, _device) = setup(medium);
+
+    let remote_ip = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+    let remote_hw = HardwareAddress::Ethernet(EthernetAddress([0x02; 6]));
+
+    iface.inner.now = Instant::ZERO;
+    iface
+        .inner
+        .neighbor_cache
+        .fill(remote_ip, remote_hw, Instant::ZERO);
+
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &remote_ip, &mut iface.fragmenter),
+        Ok((remote_hw, MockTxToken)),
+        "the first lookup should resolve and populate the cache"
+    );
+
+    iface.inner.neighbor_cache.flush();
+
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &remote_ip, &mut iface.fragmenter),
+        Ok((remote_hw, MockTxToken)),
+        "the second lookup at the same instant should come from the cache"
+    );
+}
+
+/// ...but it must not outlive the neighbor entry it mirrors.
+///
+/// A cache hit returns before `neighbor_cache.lookup()` is reached, and that
+/// lookup is the only thing enforcing `ENTRY_LIFETIME`. Without the instant in
+/// the key, a cached address was handed out forever — long past the point the
+/// stack should have re-resolved it, so a peer that moved to another MAC was
+/// never noticed.
+#[rstest]
+#[case(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+fn hardware_addr_cache_does_not_outlive_the_neighbor_entry(#[case] medium: Medium) {
+    let (mut iface, _sockets, _device) = setup(medium);
+
+    let remote_ip = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+    let remote_hw = HardwareAddress::Ethernet(EthernetAddress([0x02; 6]));
+
+    iface.inner.now = Instant::ZERO;
+    iface
+        .inner
+        .neighbor_cache
+        .fill(remote_ip, remote_hw, Instant::ZERO);
+    assert!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &remote_ip, &mut iface.fragmenter)
+            .is_ok()
+    );
+
+    // Past the entry's lifetime, so a lookup would no longer find it.
+    iface.inner.now = Instant::ZERO + NeighborCache::ENTRY_LIFETIME + Duration::from_millis(1);
+
+    assert!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &remote_ip, &mut iface.fragmenter)
+            .is_err(),
+        "the cache served an address whose neighbor entry had expired"
+    );
+}
+
+/// A neighbor whose hardware address is replaced — a peer failing over to
+/// another NIC, or an unsolicited ARP — must not keep being reached at the old
+/// one for the rest of the instant.
+#[rstest]
+#[case(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+fn hardware_addr_cache_is_dropped_when_the_neighbor_moves(#[case] medium: Medium) {
+    let (mut iface, _sockets, _device) = setup(medium);
+
+    let remote_ip = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+    let old_hw = HardwareAddress::Ethernet(EthernetAddress([0x02; 6]));
+    // Differs in the last octet, not the first: the low bit of octet 0 is the
+    // group bit, and `fill` rejects a non-unicast address.
+    let new_hw = HardwareAddress::Ethernet(EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x03]));
+
+    iface.inner.now = Instant::ZERO;
+    iface
+        .inner
+        .neighbor_cache
+        .fill(remote_ip, old_hw, Instant::ZERO);
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &remote_ip, &mut iface.fragmenter),
+        Ok((old_hw, MockTxToken))
+    );
+
+    // Same instant, so only the invalidation on fill can save this.
+    iface
+        .inner
+        .fill_neighbor_cache(remote_ip, new_hw, Instant::ZERO);
+
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &remote_ip, &mut iface.fragmenter),
+        Ok((new_hw, MockTxToken)),
+        "the cache kept routing to the neighbor's previous hardware address"
+    );
+}
