@@ -4173,12 +4173,29 @@ impl<'a> Socket<'a> {
         Ok(self.seq_to_transmit(cx))
     }
 
+    /// When this socket next needs `dispatch` to run.
+    ///
+    /// The logic here mirrors the beginning of `dispatch()` closely, and that
+    /// is a correctness requirement rather than a convenience:
+    /// `Interface::socket_egress` skips a socket entirely when this returns
+    /// [`PollAt::Ingress`], so `Ingress` has to mean `dispatch` would do
+    /// *nothing at all* — including the state changes `dispatch_setup` makes
+    /// before it ever tries to emit. Returning too early is free; returning
+    /// `Ingress` when `dispatch` had work is a socket that never runs again.
     #[allow(clippy::if_same_then_else)]
     pub(crate) fn poll_at(&self, cx: &mut Context) -> PollAt {
-        // The logic here mirrors the beginning of dispatch() closely.
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
             PollAt::Ingress
+        } else if self
+            .tuple
+            .is_some_and(|tuple| !cx.has_ip_addr(tuple.local.addr))
+        {
+            // The interface no longer has this socket's local address, so
+            // `dispatch_setup` is going to reset the connection. That reset is
+            // the only thing that ends such a socket, and reporting `Ingress`
+            // here would let an otherwise idle one be skipped forever.
+            PollAt::Now
         } else if self.remote_last_ts.is_none() {
             // Socket stopped being quiet recently, we need to acquire a timestamp.
             PollAt::Now

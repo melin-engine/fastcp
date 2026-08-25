@@ -533,3 +533,74 @@ pub fn tcp_not_accepted() {
         None,
     );
 }
+
+/// A socket whose local address is removed from the interface must be reset,
+/// even while it is otherwise idle.
+///
+/// `dispatch_setup` is the only place that check lives, so anything that skips
+/// `dispatch` also skips the reset. The egress fast filter added in fd5a946
+/// skips a socket whose `poll_at` is `PollAt::Ingress`, and `poll_at` has no
+/// corresponding check — it only inspects the tuple and the timers.
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
+fn tcp_socket_is_reset_when_its_local_address_goes_away() {
+    use crate::socket::tcp;
+
+    const REMOTE_ISN: TcpSeqNumber = TcpSeqNumber(-10001);
+    const REMOTE_PORT: u16 = 1024;
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 64]),
+        tcp::SocketBuffer::new(vec![0; 64]),
+    );
+    let handle = sockets.add(socket);
+    sockets.get_mut::<tcp::Socket>(handle).listen(4243).unwrap();
+
+    // Establish, then let the socket settle: drain everything it wants to say
+    // so that nothing but ingress could wake it.
+    feed_tcp(
+        &mut iface,
+        &mut sockets,
+        REMOTE_PORT,
+        TcpControl::Syn,
+        REMOTE_ISN,
+        None,
+    );
+    let (_, local_isn, _) =
+        dispatch_tcp(&mut iface, &mut sockets, handle).expect("a SYN-ACK should have been emitted");
+    feed_tcp(
+        &mut iface,
+        &mut sockets,
+        REMOTE_PORT,
+        TcpControl::None,
+        REMOTE_ISN + 1,
+        Some(local_isn + 1),
+    );
+    assert_eq!(
+        sockets.get_mut::<tcp::Socket>(handle).state(),
+        tcp::State::Established
+    );
+    for _ in 0..4 {
+        iface.poll(Instant::from_millis(100), &mut device, &mut sockets);
+    }
+
+    assert_eq!(
+        sockets
+            .get_mut::<tcp::Socket>(handle)
+            .poll_at(&mut iface.inner),
+        PollAt::Ingress,
+        "the socket must be idle for this test to exercise the fast filter"
+    );
+
+    // The interface loses the address the connection is bound to.
+    iface.update_ip_addrs(|addrs| addrs.clear());
+
+    iface.poll(Instant::from_millis(200), &mut device, &mut sockets);
+
+    assert_eq!(
+        sockets.get_mut::<tcp::Socket>(handle).state(),
+        tcp::State::Closed,
+        "the socket kept its connection on an address the interface no longer has"
+    );
+}
