@@ -468,7 +468,7 @@ impl InterfaceInner {
                     if flags.contains(NdiscNeighborFlags::OVERRIDE)
                         || !self.neighbor_cache.lookup(&ip_addr, self.now).found()
                     {
-                        self.neighbor_cache.fill(ip_addr, lladdr, self.now)
+                        self.fill_neighbor_cache(ip_addr, lladdr, self.now)
                     }
                 }
                 None

@@ -8,16 +8,16 @@ mod utils;
 use core::str;
 use log::{debug, error, info};
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::{Device, Loopback, Medium};
-use smoltcp::socket::tcp;
-use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
+use fastcp::iface::{Config, Interface, SocketSet};
+use fastcp::phy::{Device, Loopback, Medium};
+use fastcp::socket::tcp;
+use fastcp::time::{Duration, Instant};
+use fastcp::wire::{EthernetAddress, IpAddress, IpCidr};
 
 #[cfg(not(feature = "std"))]
 mod mock {
     use core::cell::Cell;
-    use smoltcp::time::{Duration, Instant};
+    use fastcp::time::{Duration, Instant};
 
     #[derive(Debug)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -40,7 +40,7 @@ mod mock {
 
 #[cfg(feature = "std")]
 mod mock {
-    use smoltcp::time::{Duration, Instant};
+    use fastcp::time::{Duration, Instant};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -84,7 +84,7 @@ fn main() {
         Medium::Ethernet => {
             Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
         }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ip => Config::new(fastcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
 

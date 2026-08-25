@@ -30,6 +30,15 @@ pub(crate) struct Item<'a> {
 pub struct SocketHandle(usize);
 
 impl SocketHandle {
+    /// Build a handle from a raw slab index, for tests that exercise
+    /// handle-keyed structures without standing up a [`SocketSet`]. Real
+    /// handles are only ever obtained from [`SocketSet::add`], which is what
+    /// keeps them paired with a live socket.
+    #[cfg(test)]
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
     /// Raw slab index backing this handle. Stable for the lifetime of the
     /// socket; may be reused after the socket is removed. Useful for
     /// indexing parallel per-socket state in a dense `Vec` instead of a

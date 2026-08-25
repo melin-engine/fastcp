@@ -6,12 +6,12 @@ use std::sync::Mutex;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::Tracer;
-use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
-use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use fastcp::iface::{Config, Interface, SocketSet};
+use fastcp::phy::Tracer;
+use fastcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
+use fastcp::socket::tcp;
+use fastcp::time::{Duration, Instant};
+use fastcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
 const MAC_A: HardwareAddress = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 1]));
 const MAC_B: HardwareAddress = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 2]));
@@ -333,12 +333,12 @@ pub fn setup_logging() {
             let (elapsed, side) = *CLOCK.lock().unwrap();
 
             let timestamp = format!("[{elapsed} {side}]");
-            if record.target().starts_with("smoltcp::") {
+            if record.target().starts_with("fastcp::") {
                 writeln!(
                     buf,
                     "{} ({}): {}",
                     timestamp,
-                    record.target().replace("smoltcp::", ""),
+                    record.target().replace("fastcp::", ""),
                     record.args()
                 )
             } else if record.level() == log::Level::Trace {

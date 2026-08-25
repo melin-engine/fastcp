@@ -630,6 +630,19 @@ pub struct Socket<'a> {
 
     /// Fixed-capacity array of zero-copy segment descriptors, sorted by stream_offset.
     /// Each entry points into externally-owned frame memory (e.g. DPDK mbufs).
+    ///
+    /// A fixed array rather than a heap collection: the socket is `no_std`-
+    /// friendly and this is on the ingress hot path, so the capacity is a
+    /// compile-time constant (`ZERO_COPY_RX_MAX_SEGMENTS`, tunable by cargo
+    /// feature or `SMOLTCP_` env var) and insertion needs no allocation.
+    ///
+    /// The capacity is a *segment count*, not a byte budget, and that is the
+    /// binding limit for small-segment workloads: an order-entry flow with
+    /// Nagle disabled consumes one slot per ~64-byte packet while the byte
+    /// window still reports tens of KiB free. Sizing therefore follows the
+    /// largest number of segments one socket can receive between two
+    /// application drains — for a DPDK poll loop that is the RX burst size
+    /// times the number of polls per drain cycle.
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
     zc_segments: [ZeroCopySegment; crate::config::ZERO_COPY_RX_MAX_SEGMENTS],
     /// Number of valid entries in `zc_segments`.
@@ -647,6 +660,14 @@ pub struct Socket<'a> {
     /// Callback for retaining frames when the socket stores a zero-copy segment.
     #[cfg(feature = "socket-tcp-zero-copy-rx")]
     zc_retain_fn: Option<FrameRetainFn>,
+    /// The furthest right edge (`remote_last_ack + remote_last_win`) ever
+    /// advertised, which is not necessarily the most recent one — see
+    /// [`Self::acceptance_window_end`].
+    ///
+    /// `Option` rather than a bare sequence number because there is no edge to
+    /// speak of before the first advertisement, matching `remote_last_ack`.
+    #[cfg(feature = "socket-tcp-zero-copy-rx")]
+    zc_max_win_edge: Option<TcpSeqNumber>,
 
     /// Maximum data segments this socket may dispatch in a single
     /// `dispatch_burst` call (i.e. one egress pass over the socket
@@ -701,6 +722,21 @@ enum DataSegmentResult {
     Dropped,
 }
 
+/// The right edge implied by advertising `window_len` alongside an ACK of
+/// `last_ack`, or `None` before the first advertisement.
+///
+/// A free function rather than a method so it can be used where `self` is
+/// already immutably borrowed by the segment being emitted.
+#[cfg(feature = "socket-tcp-zero-copy-rx")]
+#[inline]
+fn advertised_edge(
+    last_ack: Option<TcpSeqNumber>,
+    window_len: u16,
+    win_shift: u8,
+) -> Option<TcpSeqNumber> {
+    Some(last_ack? + ((window_len as usize) << win_shift))
+}
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -715,7 +751,6 @@ impl<'a> Socket<'a> {
         // [...] the above constraints imply that 2 * the max window size must be less
         // than 2**31 [...] Thus, the shift count must be limited to 14 (which allows
         // windows of 2**30 = 1 Gbyte).
-        #[cfg(not(target_pointer_width = "16"))] // Prevent overflow
         if rx_capacity > (1 << 30) {
             panic!("receiving buffer too large, cannot exceed 1 GiB")
         }
@@ -777,6 +812,8 @@ impl<'a> Socket<'a> {
             zc_release_fn: None,
             #[cfg(feature = "socket-tcp-zero-copy-rx")]
             zc_retain_fn: None,
+            #[cfg(feature = "socket-tcp-zero-copy-rx")]
+            zc_max_win_edge: None,
         }
     }
 
@@ -977,13 +1014,124 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Upper bound on the advertised window imposed by free zero-copy
+    /// descriptor slots. Returns `usize::MAX` (no bound) when the feature is
+    /// disabled.
+    ///
+    /// `rx_buffer.window()` counts bytes, but the zero-copy path stores one
+    /// descriptor per received segment in a fixed-capacity array. Nothing
+    /// otherwise ties the two together, so a peer can fill the byte window
+    /// with more segments than there are free slots. The overflow is dropped
+    /// without an ACK, and the retransmission resends the whole outstanding
+    /// window — which overflows again. Bounding the window converts that into
+    /// ordinary flow control: the peer simply stops until the application
+    /// drains segments and the window reopens.
+    ///
+    /// The bound is `free slots x MSS` because no segment carries more than
+    /// MSS bytes, so that many bytes always fit. It is a bound for
+    /// MSS-sized segments only — no byte-denominated window can constrain a
+    /// segment *count*, so a flow of small segments can still exhaust the
+    /// array. Sizing `ZERO_COPY_RX_MAX_SEGMENTS` for the workload is what
+    /// covers that case.
+    ///
+    /// `remote_mss` is the peer's advertised MSS (the limit on what we may
+    /// send) rather than the limit on what it may send us; the two are equal
+    /// whenever both ends share an MTU, which is the case this bound targets.
+    /// A peer on a larger MTU makes the bound permissive, never unsafe in a
+    /// new way, since that is today's unconditional behaviour.
+    ///
+    /// Only sockets driven through zero-copy ingress are bounded, identified
+    /// by a registered release callback. Release is the callback that path
+    /// cannot work without — [`recv_zero_copy()`](Self::recv_zero_copy) has no
+    /// way to hand a frame back without it — whereas retain is optional, for
+    /// transports whose frames already outlive the ingress batch. Descriptors
+    /// are stored either way, so keying the bound on retain would leave a
+    /// release-only transport with an unbounded window, which is the case the
+    /// bound exists for. Sockets fed through [`process()`] in the same build
+    /// register neither callback and keep their full byte window.
+    ///
+    /// The count of free slots deliberately includes the slot that
+    /// `process_data_segment_zero_copy` reserves for a segment at the window's
+    /// left edge. Netting that reservation out would return 0 exactly when the
+    /// left edge is missing and the array is otherwise full, which is the
+    /// state the reservation exists to keep the window open through — see the
+    /// reservation's comment there.
+    #[inline]
+    fn zero_copy_window_limit(&self) -> usize {
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            if self.zc_release_fn.is_none() {
+                return usize::MAX;
+            }
+            let free = crate::config::ZERO_COPY_RX_MAX_SEGMENTS - self.zc_segment_count;
+            free.saturating_mul(self.remote_mss)
+        }
+        #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
+        {
+            usize::MAX
+        }
+    }
+
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        let window = self.rx_buffer.window().saturating_sub(self.zc_held());
+        let window = self
+            .rx_buffer
+            .window()
+            .saturating_sub(self.zc_held())
+            .min(self.zero_copy_window_limit());
         u16::try_from(window >> self.remote_win_shift).unwrap_or(u16::MAX)
+    }
+
+    /// Return the right edge of the window the peer may legitimately have sent
+    /// into, given `window_start` as the left edge.
+    ///
+    /// Byte accounting keeps the advertised right edge monotone: the window
+    /// shrinks by exactly what the ACK advances, so `remote_last_ack +
+    /// remote_last_win` is always `remote_seq_no + rx_buffer.capacity()` and
+    /// the most recent advertisement is also the furthest one. The zero-copy
+    /// slot bound breaks that. Every segment costs a whole descriptor slot
+    /// however few bytes it carried, so `free slots x MSS` falls faster than
+    /// the ACK advances — four 1-byte segments against 32 slots and a 64-byte
+    /// MSS retract the edge by 252 bytes.
+    ///
+    /// Retracting the *advertisement* is the point of the bound, and RFC 1122
+    /// section 4.2.2.16 permits it (senders must be robust against a shrinking
+    /// window). Retracting *acceptance* is a different matter: data the peer
+    /// put in flight under the wider advertisement is legitimate, and treating
+    /// it as out-of-window draws a `challenge_ack_reply`, which is rate-limited
+    /// to one per second — a stall rather than a retransmit. So acceptance
+    /// tracks the furthest edge ever advertised while the advertisement itself
+    /// stays free to shrink.
+    ///
+    /// This never admits data the receive buffer cannot hold: every advertised
+    /// window was already `min(byte window, slot bound) <= byte window`, and
+    /// the byte-accounting edge is exactly `remote_seq_no +
+    /// rx_buffer.capacity()`, which only moves forward.
+    #[inline]
+    fn acceptance_window_end(&self, window_start: TcpSeqNumber) -> TcpSeqNumber {
+        let Some(last_ack) = self.remote_last_ack else {
+            return window_start;
+        };
+        let last_edge = last_ack + ((self.remote_last_win as usize) << self.remote_win_shift);
+
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            let Some(max_edge) = self.zc_max_win_edge else {
+                return last_edge;
+            };
+            // Never admit more than the receive buffer can hold, whatever was
+            // advertised earlier. The byte-accounting edge sits at exactly
+            // `remote_seq_no + rx_buffer.capacity()`, so this clamp is inert
+            // as long as the buffer every advertisement was computed against
+            // is still the one in place.
+            let byte_edge = self.remote_seq_no + self.rx_buffer.capacity();
+            max_edge.min(byte_edge).max(last_edge)
+        }
+        #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
+        last_edge
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -994,13 +1142,25 @@ impl<'a> Socket<'a> {
     /// since the last window update and adjust the window length accordingly. This ensures a fair
     /// comparison between the last window length and the new window length we're going to
     /// advertise.
+    ///
+    /// More can arrive than the last advertisement covered, in which case the
+    /// remainder is zero: everything advertised has been consumed and then
+    /// some. That happens whenever acceptance reaches past the last advertised
+    /// edge — see [`Self::acceptance_window_end`] — and the subtraction has to
+    /// saturate, because `TcpSeqNumber - TcpSeqNumber` panics on underflow in
+    /// every build, not just debug ones.
     #[inline]
     fn last_scaled_window(&self) -> Option<u16> {
         let last_ack = self.remote_last_ack?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let last_edge = last_ack + last_win;
+        let last_win_adjusted = if next_ack > last_edge {
+            0
+        } else {
+            last_edge - next_ack
+        };
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -1196,6 +1356,10 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            self.zc_max_win_edge = None;
+        }
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1262,9 +1426,9 @@ impl<'a> Socket<'a> {
     /// #     feature = "proto-ipv4",
     /// # ))]
     /// # {
-    /// # use smoltcp::socket::tcp::{Socket, SocketBuffer};
-    /// # use smoltcp::iface::Interface;
-    /// # use smoltcp::wire::IpAddress;
+    /// # use fastcp::socket::tcp::{Socket, SocketBuffer};
+    /// # use fastcp::iface::Interface;
+    /// # use fastcp::wire::IpAddress;
     /// #
     /// # fn get_ephemeral_port() -> u16 {
     /// #     49152
@@ -1877,6 +2041,17 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
+        // Keep the furthest advertised edge, so acceptance stays put when the
+        // slot bound retracts the window — see `acceptance_window_end`.
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        if let Some(edge) = advertised_edge(
+            self.remote_last_ack,
+            self.remote_last_win,
+            self.remote_win_shift,
+        ) && self.zc_max_win_edge.is_none_or(|max_edge| edge > max_edge)
+        {
+            self.zc_max_win_edge = Some(edge);
+        }
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -2087,11 +2262,7 @@ impl<'a> Socket<'a> {
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
-        } else {
-            window_start
-        };
+        let window_end = self.acceptance_window_end(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -2671,12 +2842,7 @@ impl<'a> Socket<'a> {
                     DataSegmentResult::Reply(reply) => {
                         // Challenge ACK or similar — finalize what we have and return.
                         if batch.segments_processed > 0 {
-                            self.process_batch_finalize(
-                                cx,
-                                &batch,
-                                last_ip_repr.unwrap(),
-                                last_tcp_repr.unwrap(),
-                            );
+                            self.process_batch_finalize(cx, &batch);
                         }
                         return reply;
                     }
@@ -2687,12 +2853,7 @@ impl<'a> Socket<'a> {
             // Slow path: control segment or non-ESTABLISHED state.
             // Finalize any accumulated batch state first.
             if batch.segments_processed > 0 {
-                self.process_batch_finalize(
-                    cx,
-                    &batch,
-                    last_ip_repr.unwrap(),
-                    last_tcp_repr.unwrap(),
-                );
+                self.process_batch_finalize(cx, &batch);
                 batch = BatchAccumulator::default();
                 last_ip_repr = None;
                 last_tcp_repr = None;
@@ -2708,12 +2869,15 @@ impl<'a> Socket<'a> {
 
         // Finalize the batch.
         if batch.segments_processed > 0 {
-            self.process_batch_finalize(cx, &batch, last_ip_repr.unwrap(), last_tcp_repr.unwrap());
+            self.process_batch_finalize(cx, &batch);
 
             // Generate a single ACK reply if we have data to acknowledge.
-            if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
-                let ip = last_ip_repr.unwrap();
-                let tcp = last_tcp_repr.unwrap();
+            // `segments_processed` is only ever incremented on the path that
+            // also records these, so both are `Some` here; matching on them
+            // states that rather than asserting it.
+            if let (Some(ip), Some(tcp)) = (last_ip_repr, last_tcp_repr)
+                && (!self.assembler.is_empty() || !batch.assembler_was_empty_at_start)
+            {
                 return Some(self.ack_reply(ip, tcp));
             }
         }
@@ -2754,11 +2918,7 @@ impl<'a> Socket<'a> {
 
         // --- Window/sequence validation ---
         let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
-        } else {
-            window_start
-        };
+        let window_end = self.acceptance_window_end(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -2789,6 +2949,21 @@ impl<'a> Socket<'a> {
             }
         };
 
+        // --- Window update ---
+        //
+        // Applied per segment, ahead of the ACK block, for two reasons.
+        // Duplicate-ACK detection below tests it, and `process()` updates
+        // `remote_win_len` as each segment goes by: the second of two segments
+        // carrying the same window is not a window update, and would look like
+        // one if every segment in the batch were compared against the value
+        // from before the batch started.
+        let scale = self.remote_win_scale.unwrap_or(0);
+        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        let is_window_update = new_remote_win_len != self.remote_win_len;
+        self.remote_win_len = new_remote_win_len;
+        batch.last_window_len = Some(new_remote_win_len);
+        batch.is_window_update = batch.is_window_update || is_window_update;
+
         // --- ACK len computation (without RTT/congestion calls) ---
         let mut ack_len = 0;
         let mut ack_all = false;
@@ -2814,19 +2989,62 @@ impl<'a> Socket<'a> {
                 self.tx_waker.wake();
             }
 
+            // --- Duplicate ACK detection (must be per-segment) ---
+            //
+            // Deferring this to `process_batch_finalize` counted a whole burst
+            // of duplicate ACKs as a single observation — and, because that one
+            // observation takes the `_` arm below and merely records
+            // `local_rx_last_ack`, as no observation at all. Fast retransmit
+            // arms at exactly the third duplicate, and a peer sends its
+            // duplicates back to back, which is one RX burst: batching demoted
+            // every fast retransmit to an RTO timeout.
+            //
+            // This mirrors the same block in `process()`; the expensive
+            // per-ACK work (RTT estimation, congestion control on_ack) stays
+            // deferred, since only the duplicate bookkeeping is order-sensitive.
+            match self.local_rx_last_ack {
+                Some(last_rx_ack)
+                    if repr.payload.is_empty()
+                        && last_rx_ack == ack_number
+                        && ack_number < self.remote_last_seq
+                        && !is_window_update =>
+                {
+                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_duplicate_ack(cx.now());
+
+                    net_debug!(
+                        "received duplicate ACK for seq {} (duplicate nr {}{})",
+                        ack_number,
+                        self.local_rx_dup_acks,
+                        if self.local_rx_dup_acks == u8::MAX {
+                            "+"
+                        } else {
+                            ""
+                        }
+                    );
+
+                    if self.local_rx_dup_acks == 3 {
+                        self.timer.set_for_fast_retransmit();
+                        net_debug!("started fast retransmit");
+                    }
+                }
+                _ => {
+                    if self.local_rx_dup_acks > 0 {
+                        self.local_rx_dup_acks = 0;
+                        net_debug!("reset duplicate ACK count");
+                    }
+                    self.local_rx_last_ack = Some(ack_number);
+                }
+            }
+
             // Advance local_seq_no (must be per-segment for next ack_len computation).
             self.local_seq_no = ack_number;
             if self.remote_last_seq < self.local_seq_no {
                 self.remote_last_seq = self.local_seq_no;
             }
         }
-
-        // --- Window update (accumulate for finalize) ---
-        let scale = self.remote_win_scale.unwrap_or(0);
-        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
-        batch.last_window_len = Some(new_remote_win_len);
-        batch.is_window_update =
-            batch.is_window_update || new_remote_win_len != self.remote_win_len;
 
         // --- Timestamp (accumulate for finalize) ---
         if let Some(timestamp) = repr.timestamp {
@@ -2866,13 +3084,7 @@ impl<'a> Socket<'a> {
     /// Run the deferred bookkeeping after processing a batch of data segments.
     /// This covers RTT estimation, congestion control, timer management,
     /// duplicate ACK detection, and delayed ACK handling.
-    fn process_batch_finalize(
-        &mut self,
-        cx: &mut Context,
-        batch: &BatchAccumulator,
-        _last_ip_repr: &IpRepr,
-        last_repr: &TcpRepr,
-    ) {
+    fn process_batch_finalize(&mut self, cx: &mut Context, batch: &BatchAccumulator) {
         // RTT estimation + congestion control — once with final values.
         if let Some(ack_number) = batch.last_ack_number {
             self.rtte.on_ack(cx.now(), ack_number);
@@ -2894,32 +3106,8 @@ impl<'a> Socket<'a> {
                 .set_remote_window(new_remote_win_len);
         }
 
-        // Duplicate ACK detection — only the last segment matters.
-        if let Some(ack_number) = batch.last_ack_number {
-            let is_window_update = batch.is_window_update;
-            match self.local_rx_last_ack {
-                Some(last_rx_ack)
-                    if last_repr.payload.is_empty()
-                        && last_rx_ack == ack_number
-                        && ack_number < self.remote_last_seq
-                        && !is_window_update =>
-                {
-                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
-                    self.congestion_controller
-                        .inner_mut()
-                        .on_duplicate_ack(cx.now());
-                    if self.local_rx_dup_acks == 3 {
-                        self.timer.set_for_fast_retransmit();
-                    }
-                }
-                _ => {
-                    if self.local_rx_dup_acks > 0 {
-                        self.local_rx_dup_acks = 0;
-                    }
-                    self.local_rx_last_ack = Some(ack_number);
-                }
-            }
-        }
+        // Duplicate ACK detection is deliberately absent here: it is
+        // order-sensitive and runs per segment in `process_data_segment`.
 
         // Timestamp option.
         if let Some(tsval) = batch.last_timestamp_tsval {
@@ -3016,12 +3204,7 @@ impl<'a> Socket<'a> {
                     }
                     DataSegmentResult::Reply(reply) => {
                         if batch.segments_processed > 0 {
-                            self.process_batch_finalize(
-                                cx,
-                                &batch,
-                                last_ip_repr.unwrap(),
-                                last_tcp_repr.unwrap(),
-                            );
+                            self.process_batch_finalize(cx, &batch);
                         }
                         return reply;
                     }
@@ -3031,12 +3214,7 @@ impl<'a> Socket<'a> {
 
             // Slow path: control segment or non-ESTABLISHED state.
             if batch.segments_processed > 0 {
-                self.process_batch_finalize(
-                    cx,
-                    &batch,
-                    last_ip_repr.unwrap(),
-                    last_tcp_repr.unwrap(),
-                );
+                self.process_batch_finalize(cx, &batch);
                 batch = BatchAccumulator::default();
                 last_ip_repr = None;
                 last_tcp_repr = None;
@@ -3050,11 +3228,14 @@ impl<'a> Socket<'a> {
         }
 
         if batch.segments_processed > 0 {
-            self.process_batch_finalize(cx, &batch, last_ip_repr.unwrap(), last_tcp_repr.unwrap());
+            self.process_batch_finalize(cx, &batch);
 
-            if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
-                let ip = last_ip_repr.unwrap();
-                let tcp = last_tcp_repr.unwrap();
+            // `segments_processed` is only ever incremented on the path that
+            // also records these, so both are `Some` here; matching on them
+            // states that rather than asserting it.
+            if let (Some(ip), Some(tcp)) = (last_ip_repr, last_tcp_repr)
+                && (!self.assembler.is_empty() || !batch.assembler_was_empty_at_start)
+            {
                 return Some(self.ack_reply(ip, tcp));
             }
         }
@@ -3094,11 +3275,7 @@ impl<'a> Socket<'a> {
 
         // --- Window/sequence validation ---
         let window_start = self.remote_seq_no + self.rx_buffer.len() + self.zc_held();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
-        } else {
-            window_start
-        };
+        let window_end = self.acceptance_window_end(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -3175,29 +3352,209 @@ impl<'a> Socket<'a> {
             batch.assembler_was_empty_at_start = self.assembler.is_empty();
         }
 
-        let payload_len = payload.len();
-        if payload_len > 0 {
+        if !payload.is_empty() {
+            // The window check trimmed the payload against the window's left
+            // edge, which is the contiguous frontier, but nothing trimmed it
+            // against the out-of-order descriptors sitting past that frontier.
+            // A retransmission overlapping one of those — go-back-N, a
+            // spurious RTO resending from `snd_una`, or a peer that
+            // recombined its send queue — would be stored as a second
+            // descriptor covering bytes another descriptor already holds.
+            // `recv_zero_copy` then consumes the front one, stops at the
+            // overlapped offset, and subtracts what it consumed from a
+            // `stream_offset` smaller than that count: a panic in debug, and
+            // in release a wrapped offset that no later segment can ever
+            // match, so the socket delivers nothing again and its frames are
+            // never released.
+            //
+            // Descriptors are kept sorted and non-overlapping, so at most one
+            // holds the incoming range's start and at most one extends past
+            // its end. Trimming against those two leaves a range that either
+            // fills a single gap or is empty, and every descriptor left
+            // inside it is a duplicate to be dropped in the new segment's
+            // favour.
+            //
+            // The two tests are deliberately asymmetric. A descriptor ending
+            // exactly where the incoming range ends is treated as covered
+            // rather than as a tail overlap, so a retransmission that resends
+            // a whole run of held segments supersedes all of them instead of
+            // being trimmed short of the last one. A descriptor starting
+            // exactly where the incoming range starts is treated as a head
+            // overlap, so an exact duplicate is dropped outright rather than
+            // released and re-retained for no gain.
+            let abs_start = self.zc_contiguous_bytes + payload_offset;
+            let abs_end = abs_start + payload.len();
+
+            // Sorted and non-overlapping means offsets and ends both increase
+            // monotonically, so each lookup below is a `partition_point`
+            // rather than a scan. That is not a micro-optimisation: a full
+            // pass per lookup would put unconditional O(descriptors) work on
+            // the in-order arrival path, which is otherwise O(1) — the insert
+            // below binary-searches too, and its `copy_within` is a no-op for
+            // an append. The array is sized for hundreds of descriptors
+            // queued behind a lagging application, which is exactly when that
+            // path must stay cheap.
+            let held = &self.zc_segments[..self.zc_segment_count];
+
+            // The last descriptor starting at or before `abs_start` is the
+            // only one that can contain it.
+            let mut trim_start = abs_start;
+            let head = held.partition_point(|seg| seg.stream_offset <= abs_start);
+            if head > 0 {
+                let seg = &held[head - 1];
+                if abs_start < seg.stream_offset + seg.data_len {
+                    trim_start = seg.stream_offset + seg.data_len;
+                }
+            }
+
+            // Likewise, the last descriptor starting before `abs_end` is the
+            // only one that can extend past it.
+            let mut trim_end = abs_end;
+            let tail = held.partition_point(|seg| seg.stream_offset < abs_end);
+            if tail > 0 {
+                let seg = &held[tail - 1];
+                if abs_end < seg.stream_offset + seg.data_len {
+                    trim_end = seg.stream_offset;
+                }
+            }
+
+            // The searches are only equivalent to an exhaustive scan while the
+            // array really is sorted and non-overlapping. That invariant is
+            // maintained here and in `recv_zero_copy`, several hundred lines
+            // apart, so it is cross-checked rather than assumed.
+            #[cfg(debug_assertions)]
+            {
+                let (mut scan_start, mut scan_end) = (abs_start, abs_end);
+                for seg in held {
+                    let (seg_start, seg_end) =
+                        (seg.stream_offset, seg.stream_offset + seg.data_len);
+                    if seg_start <= abs_start && abs_start < seg_end {
+                        scan_start = seg_end;
+                    }
+                    if seg_start < abs_end && abs_end < seg_end {
+                        scan_end = seg_start;
+                    }
+                }
+                debug_assert_eq!(
+                    (trim_start, trim_end),
+                    (scan_start, scan_end),
+                    "binary-searched overlap trim disagrees with a linear scan"
+                );
+            }
+
+            if trim_start >= trim_end {
+                // Every byte is already held. The frame is not retained, so
+                // the transport recycles it with the batch, and the segment
+                // still counts as processed so the peer is re-ACKed.
+                batch.segments_processed += 1;
+                return DataSegmentResult::Ok;
+            }
+
+            // Descriptors the stored range will fully cover. They form one
+            // contiguous run: `stream_offset >= trim_start` selects a suffix
+            // of the array and `end <= trim_end` a prefix, so the two bounds
+            // intersect in a single slice. Located here because the slots
+            // they free belong in the capacity check below; they are actually
+            // released further down, once every fallible step has succeeded.
+            let evict_from = held.partition_point(|seg| seg.stream_offset < trim_start);
+            // `partition_point` on the end bound can land before `evict_from`
+            // when nothing is covered, so the run is clamped to empty.
+            let evict_to = held
+                .partition_point(|seg| seg.stream_offset + seg.data_len <= trim_end)
+                .max(evict_from);
+            let evicted = evict_to - evict_from;
+            debug_assert_eq!(
+                evicted,
+                held.iter()
+                    .filter(|seg| trim_start <= seg.stream_offset
+                        && seg.stream_offset + seg.data_len <= trim_end)
+                    .count(),
+                "binary-searched eviction run disagrees with a linear scan"
+            );
+
+            let payload = &payload[trim_start - abs_start..trim_end - abs_start];
+            let payload_len = payload.len();
+
+            // Descriptor capacity is checked before the assembler is touched.
+            // `add_then_remove_front` mutates assembler state, so bailing out
+            // after it would leave the assembler believing these bytes had
+            // arrived while no descriptor holds them — the retransmission
+            // would then be placed at the wrong stream offset. Dropping ahead
+            // of any state change is a clean drop the peer simply retransmits.
+            //
+            // The advertised window is bounded by free slots
+            // (`zero_copy_window_limit`), so a conforming peer should not
+            // reach this; small segments can still get here, since no
+            // byte-denominated window bounds a segment count.
+            //
+            // The final slot is reserved for a segment covering the window's
+            // left edge (`payload_offset == 0`). Without that reservation,
+            // out-of-order segments can fill the array while the left edge is
+            // still missing — the ordinary single-loss case. The advertised
+            // window then falls to zero, the peer's retransmission of the
+            // missing segment is refused by the zero-window check, the gap is
+            // never filled, no bytes ever become contiguous,
+            // `recv_zero_copy()` can free nothing, and the connection is
+            // stalled for good. Holding one slot back keeps the window open
+            // for as long as the left edge is missing, so the retransmission
+            // is accepted; arriving at offset 0 it always advances the
+            // contiguous frontier, which lets the application drain and free
+            // slots.
+            //
+            // The window that survives is one MSS rounded down to the window
+            // scale granularity, so a peer sending full-MSS segments may have
+            // to split the retransmission and spend a second slot on the
+            // remainder. That still makes progress, which is all the
+            // reservation has to guarantee.
+            let reserved = usize::from(trim_start != self.zc_contiguous_bytes);
+            if self.zc_segment_count - evicted + reserved
+                >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS
+            {
+                // The retain callback was NOT called, so the backing frame is
+                // freed normally by the transport's batch recycle.
+                net_debug!("zero-copy RX descriptor array full, dropping segment");
+                return DataSegmentResult::Dropped;
+            }
+
+            // The assembler is given the segment's original range, not the
+            // trimmed one: it tracks which bytes have arrived, and the bytes
+            // trimmed off had arrived earlier in the descriptors that still
+            // hold them. Adding either range yields the same set, and the
+            // original keeps `contig_len` identical to what a non-overlapping
+            // segment of the same extent would have produced.
             let Ok(contig_len) = self
                 .assembler
-                .add_then_remove_front(payload_offset, payload_len)
+                .add_then_remove_front(payload_offset, abs_end - abs_start)
             else {
                 // Assembler full — drop the segment. Retain was not called,
                 // so the backing frame is freed normally by batch recycle.
                 return DataSegmentResult::Dropped;
             };
 
-            // Store a descriptor instead of copying into rx_buffer.
-            if self.zc_segment_count >= crate::config::ZERO_COPY_RX_MAX_SEGMENTS {
-                // Array full — drop the segment. The retain callback was
-                // NOT called, so the backing frame will be freed normally
-                // by the transport's batch recycle.
-                return DataSegmentResult::Dropped;
+            // Release the descriptors the stored range supersedes. Every
+            // fallible step is behind us, so the array and the assembler stay
+            // in agreement. None of them can be part of the contiguous front:
+            // `trim_start` is at or past the frontier, and so is every offset
+            // at or past `trim_start`.
+            if evicted > 0 {
+                for i in evict_from..evict_to {
+                    let seg = self.zc_segments[i];
+                    if let Some(release_fn) = self.zc_release_fn {
+                        release_fn(seg.frame_handle);
+                    }
+                    self.zc_held_bytes -= seg.data_len;
+                }
+                // One contiguous run, so closing the hole is a single move of
+                // the tail rather than a compaction pass.
+                let count = self.zc_segment_count;
+                self.zc_segments.copy_within(evict_to..count, evict_from);
+                self.zc_segment_count = count - evicted;
             }
 
-            // Compute absolute stream offset: zc_contiguous_bytes is the
-            // "virtual rx_buffer.len()" and payload_offset is relative to the
-            // current window start, so their sum gives the absolute position.
-            let abs_offset = self.zc_contiguous_bytes + payload_offset;
+            // The absolute stream offset of the bytes actually stored:
+            // `zc_contiguous_bytes` is the "virtual rx_buffer.len()" and
+            // `trim_start` is already measured from the same origin.
+            let abs_offset = trim_start;
 
             let seg = ZeroCopySegment {
                 data_ptr: payload.as_ptr(),
@@ -3263,7 +3620,7 @@ impl<'a> Socket<'a> {
         let mut batch = BatchAccumulator::default();
         match self.process_data_segment_zero_copy(cx, ip_repr, repr, frame_handle, &mut batch) {
             DataSegmentResult::Ok => {
-                self.process_batch_finalize(cx, &batch, ip_repr, repr);
+                self.process_batch_finalize(cx, &batch);
                 if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
                     return Some(self.ack_reply(ip_repr, repr));
                 }
@@ -3773,6 +4130,17 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = repr.seq_number + repr.segment_len();
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
+        // Keep the furthest advertised edge, so acceptance stays put when the
+        // slot bound retracts the window — see `acceptance_window_end`.
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        if let Some(edge) = advertised_edge(
+            self.remote_last_ack,
+            self.remote_last_win,
+            self.remote_win_shift,
+        ) && self.zc_max_win_edge.is_none_or(|max_edge| edge > max_edge)
+        {
+            self.zc_max_win_edge = Some(edge);
+        }
 
         if repr.segment_len() > 0 {
             self.rtte
@@ -3805,12 +4173,29 @@ impl<'a> Socket<'a> {
         Ok(self.seq_to_transmit(cx))
     }
 
+    /// When this socket next needs `dispatch` to run.
+    ///
+    /// The logic here mirrors the beginning of `dispatch()` closely, and that
+    /// is a correctness requirement rather than a convenience:
+    /// `Interface::socket_egress` skips a socket entirely when this returns
+    /// [`PollAt::Ingress`], so `Ingress` has to mean `dispatch` would do
+    /// *nothing at all* — including the state changes `dispatch_setup` makes
+    /// before it ever tries to emit. Returning too early is free; returning
+    /// `Ingress` when `dispatch` had work is a socket that never runs again.
     #[allow(clippy::if_same_then_else)]
     pub(crate) fn poll_at(&self, cx: &mut Context) -> PollAt {
-        // The logic here mirrors the beginning of dispatch() closely.
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
             PollAt::Ingress
+        } else if self
+            .tuple
+            .is_some_and(|tuple| !cx.has_ip_addr(tuple.local.addr))
+        {
+            // The interface no longer has this socket's local address, so
+            // `dispatch_setup` is going to reset the connection. That reset is
+            // the only thing that ends such a socket, and reporting `Ingress`
+            // here would let an otherwise idle one be skipped forever.
+            PollAt::Now
         } else if self.remote_last_ts.is_none() {
             // Socket stopped being quiet recently, we need to acquire a timestamp.
             PollAt::Now
@@ -4177,6 +4562,13 @@ mod test {
         s.remote_last_seq = LOCAL_SEQ + 1;
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
         s.remote_last_win = s.scaled_window();
+        // The handshake's advertisement is faked by assigning the fields
+        // directly, so record its right edge the way `dispatch` would have.
+        #[cfg(feature = "socket-tcp-zero-copy-rx")]
+        {
+            s.zc_max_win_edge =
+                advertised_edge(s.remote_last_ack, s.remote_last_win, s.remote_win_shift);
+        }
         s
     }
 
@@ -7283,6 +7675,56 @@ mod test {
             &buf_batch[..n_batch],
             &buf_seq[..n_seq],
             "rx_buffer content mismatch"
+        );
+    }
+
+    /// Three duplicate ACKs must trigger fast retransmit whether the peer's
+    /// segments arrive one at a time or together in one RX burst.
+    ///
+    /// `process_batch_finalize` runs duplicate-ACK detection once per batch,
+    /// off `batch.last_ack_number` alone, so a burst of N duplicates counts as
+    /// one. Fast retransmit fires at exactly 3, and a DPDK RX burst delivers
+    /// precisely this shape — three dup ACKs in a single poll — so batching
+    /// silently demotes fast retransmit to an RTO timeout.
+    ///
+    /// Differential against the sequential path, like
+    /// `test_process_batch_differential_vs_sequential`, which compares only
+    /// sequence numbers and buffers and so cannot see this.
+    #[test]
+    fn test_process_batch_counts_duplicate_acks_like_sequential() {
+        let mut s_batch = socket_established();
+        let mut s_seq = socket_established();
+        s_batch.cx.set_now(Instant::from_millis(0));
+        s_seq.cx.set_now(Instant::from_millis(0));
+
+        // Data in flight, so an ACK below `remote_last_seq` reads as a
+        // duplicate rather than as new information.
+        for s in [&mut s_batch, &mut s_seq] {
+            s.send_slice(b"abcdef").unwrap();
+            let _ = s.socket.dispatch(&mut s.cx, |_, _| Ok::<(), ()>(()));
+        }
+
+        let dup = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[],
+            ..SEND_TEMPL
+        };
+        let segments: Vec<(IpRepr, TcpRepr)> = (0..3).map(|_| (RECV_IP_TEMPL, dup)).collect();
+
+        let _ = s_batch.socket.process_batch(&mut s_batch.cx, &segments);
+        for (ip, tcp) in &segments {
+            let _ = s_seq.socket.process(&mut s_seq.cx, ip, tcp);
+        }
+
+        assert_eq!(
+            s_batch.local_rx_dup_acks, s_seq.local_rx_dup_acks,
+            "batched duplicate ACKs were not counted like sequential ones"
+        );
+        assert_eq!(
+            matches!(s_batch.timer, Timer::FastRetransmit),
+            matches!(s_seq.timer, Timer::FastRetransmit),
+            "the two paths disagree on whether fast retransmit is armed"
         );
     }
 
@@ -10451,6 +10893,11 @@ mod test {
             RELEASED_HANDLES.with(|h| h.borrow_mut().push(handle.bytes));
         }
 
+        /// A real transport bumps the frame refcount here; the tests only need
+        /// the callback to be present, since that is what marks the socket as
+        /// zero-copy driven.
+        fn test_retain_fn(_handle: OpaqueFrameHandle) {}
+
         fn make_handle(id: u8) -> OpaqueFrameHandle {
             let mut bytes = [0u8; 16];
             bytes[0] = id;
@@ -10763,6 +11210,551 @@ mod test {
 
             // No zero-copy segments should be held (RST has no payload).
             assert_eq!(released_handles().len(), 0);
+        }
+
+        /// Feed `count` one-byte segments through the zero-copy batch path,
+        /// starting at `REMOTE_SEQ + 1`, one descriptor slot each.
+        fn fill_slots(s: &mut TestSocket, count: usize) {
+            for i in 0..count {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + i,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"x",
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+        }
+
+        /// A socket whose byte window is far larger than the descriptor array
+        /// can cover, so the slot bound is what binds. 32 slots (the test
+        /// config) x 64 B MSS = 2048, against a 4096-byte receive buffer.
+        fn socket_with_binding_slot_bound() -> TestSocket {
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.socket.set_zero_copy_retain_fn(test_retain_fn);
+            s.socket.remote_mss = 64;
+            // The callbacks and the MSS land after `socket_established*` has
+            // faked the handshake advertisement, so redo it under the bound.
+            s.socket.remote_last_win = s.socket.scaled_window();
+            s.socket.zc_max_win_edge = advertised_edge(
+                s.socket.remote_last_ack,
+                s.socket.remote_last_win,
+                s.socket.remote_win_shift,
+            );
+            s.cx.set_now(Instant::from_millis(0));
+            s
+        }
+
+        #[test]
+        fn window_is_bounded_by_free_zero_copy_slots() {
+            clear_released();
+            let s = socket_with_binding_slot_bound();
+
+            // Not the 4096 bytes the receive buffer has free.
+            assert_eq!(s.socket.scaled_window(), 2048);
+        }
+
+        #[test]
+        fn window_is_unbounded_without_zero_copy_callbacks() {
+            clear_released();
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.remote_mss = 64;
+
+            // Same build, same buffers, but this socket is fed through
+            // `process()` — the slot bound must not throttle it.
+            assert_eq!(s.socket.scaled_window(), 4096);
+        }
+
+        #[test]
+        fn window_is_bounded_with_release_only() {
+            clear_released();
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.socket.remote_mss = 64;
+
+            // Retain is optional — a transport whose frames outlive the
+            // ingress batch registers release alone — but descriptors are
+            // stored either way, so the bound has to apply.
+            assert_eq!(s.socket.scaled_window(), 2048);
+        }
+
+        #[test]
+        fn window_tracks_slots_not_just_bytes() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            fill_slots(&mut s, 4);
+
+            // Byte accounting alone would still advertise 4092. Four slots are
+            // gone, so the real capacity is 28 x 64.
+            assert_eq!(s.socket.scaled_window(), 28 * 64);
+        }
+
+        #[test]
+        fn full_descriptor_array_advertises_a_zero_window() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            fill_slots(&mut s, crate::config::ZERO_COPY_RX_MAX_SEGMENTS);
+
+            // The peer is told to stop rather than being left to overrun the
+            // array and have the excess dropped without an ACK.
+            assert_eq!(s.socket.scaled_window(), 0);
+        }
+
+        #[test]
+        fn a_slot_exhausted_drop_leaves_reassembly_state_untouched() {
+            clear_released();
+            const CAP: usize = crate::config::ZERO_COPY_RX_MAX_SEGMENTS;
+
+            // Segments are fed in directly rather than through an
+            // advertisement, so the array is overrun regardless of the window
+            // — the same position a conforming peer reaches with segments
+            // already in flight under an older, wider window.
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            s.socket.set_zero_copy_release_fn(test_release_fn);
+            s.cx.set_now(Instant::from_millis(0));
+
+            // Offset 0 never arrives, so nothing becomes contiguous and every
+            // segment keeps its slot; they fill the array up to the slot held
+            // back for the missing left edge.
+            for i in 1..=CAP {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + i,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"x",
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+            assert_eq!(s.socket.zc_segment_count, CAP - 1);
+
+            let assembler_before = s.socket.assembler.clone();
+
+            // One more segment, extending the range the assembler already
+            // holds so it would be accepted, but with no slot left to hold it.
+            // The drop has to happen before the assembler records the range:
+            // bytes marked received that no descriptor holds would misplace
+            // every later segment once the gap at offset 0 is filled.
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + CAP,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"y",
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, seg, make_handle(0xff))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            assert_eq!(s.socket.zc_segment_count, CAP - 1);
+            assert_eq!(s.socket.assembler, assembler_before);
+        }
+
+        #[test]
+        fn a_left_edge_gap_does_not_deadlock_a_full_descriptor_array() {
+            clear_released();
+            const CAP: usize = crate::config::ZERO_COPY_RX_MAX_SEGMENTS;
+            let mut s = socket_with_binding_slot_bound();
+
+            // The ordinary single-loss case: every segment after the first
+            // byte arrives, so nothing becomes contiguous and each one keeps
+            // its slot.
+            for i in 1..=CAP {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + i,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"x",
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+
+            // One slot is held back for the missing left edge, so the window
+            // stays open instead of collapsing to zero with nothing the
+            // application can drain to reopen it.
+            assert_eq!(s.socket.zc_segment_count, CAP - 1);
+            assert_eq!(s.socket.zc_contiguous_bytes, 0);
+            assert_ne!(s.socket.scaled_window(), 0);
+
+            // The peer retransmits the lost segment; it has to be accepted.
+            let retransmit = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"x",
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, retransmit, make_handle(0xfe))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            // Filling the gap advances the contiguous frontier, which is what
+            // lets the application drain and hand every slot back.
+            assert_eq!(s.socket.zc_segment_count, CAP);
+            assert_eq!(s.socket.zc_contiguous_bytes, CAP);
+
+            while s.socket.recv_zero_copy(|slice| slice.len()).unwrap() != 0 {}
+
+            assert_eq!(s.socket.zc_segment_count, 0);
+            assert_eq!(s.socket.scaled_window(), 2048);
+        }
+
+        #[test]
+        fn a_retracted_window_still_accepts_data_sent_under_the_old_edge() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // The edge the peer has already been cleared to send up to.
+            let old_end = s.socket.zc_max_win_edge.unwrap();
+            assert_eq!(old_end, REMOTE_SEQ + 1 + 2048);
+
+            // Four 1-byte segments cost four slots but advance the ACK by only
+            // four bytes, so the next advertisement retracts the right edge by
+            // 4 x (64 - 1) bytes.
+            fill_slots(&mut s, 4);
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert_eq!(repr.unwrap().window_len, 28 * 64);
+            });
+            let new_end = s.socket.remote_last_ack.unwrap() + (s.socket.remote_last_win as usize);
+            assert_eq!(new_end, old_end - 252);
+
+            // A segment the peer put in flight under the old advertisement,
+            // landing past the retracted edge. It is legitimate data, so it
+            // has to be taken rather than answered with a challenge ACK --
+            // those are rate-limited to one per second.
+            let seg = TcpRepr {
+                seq_number: new_end + 8,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"z",
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, seg, make_handle(0xfd))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+
+            assert_eq!(s.socket.zc_segment_count, 5);
+        }
+
+        #[test]
+        fn arrivals_past_the_retracted_edge_do_not_underflow_the_last_window() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // Retract the advertised edge by 4 x (64 - 1) bytes, then let the
+            // application drain so the slots are free again.
+            fill_slots(&mut s, 4);
+            recv(&mut s, Instant::from_millis(0), |_| {});
+            assert_eq!(s.socket.recv_zero_copy(|b| b.len()).unwrap(), 4);
+
+            // A run of full-MSS segments the peer had in flight under the old
+            // edge. They are accepted, so the ACK frontier advances past the
+            // edge that was last advertised -- `last_scaled_window` is then
+            // asked for a remainder that does not exist.
+            const MSS: [u8; 64] = [b'q'; 64];
+            for i in 0..29usize {
+                let seg = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + 4 + i * 64,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &MSS,
+                    ..SEND_TEMPL
+                };
+                let segments = [(RECV_IP_TEMPL, seg, make_handle(i as u8))];
+                let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+            }
+            assert_eq!(s.socket.zc_contiguous_bytes, 29 * 64);
+
+            // Nothing of the last advertisement is left, and the peer is owed
+            // the update saying so. Both of these panicked before the
+            // saturating subtraction, as did `poll_at` and `dispatch` below.
+            assert_eq!(s.socket.last_scaled_window(), Some(0));
+            assert!(s.socket.window_to_update());
+
+            let _at = s.socket.poll_at(&mut s.cx);
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert!(repr.unwrap().window_len > 0);
+            });
+        }
+
+        /// Feed one segment through the zero-copy batch path.
+        fn feed(s: &mut TestSocket, offset: usize, payload: &[u8], handle: u8) {
+            let seg = TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + offset,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload,
+                ..SEND_TEMPL
+            };
+            let segments = [(RECV_IP_TEMPL, seg, make_handle(handle))];
+            let _reply = s.socket.process_batch_zero_copy(&mut s.cx, &segments);
+        }
+
+        /// The descriptor array must stay sorted, non-overlapping, and in
+        /// agreement with the two byte counters.
+        fn assert_descriptors_tile(s: &TestSocket) {
+            let mut expected = 0;
+            let mut held = 0;
+            for i in 0..s.socket.zc_segment_count {
+                let seg = &s.socket.zc_segments[i];
+                assert!(
+                    seg.stream_offset >= expected,
+                    "descriptor {i} at {} overlaps or precedes {expected}",
+                    seg.stream_offset
+                );
+                expected = seg.stream_offset + seg.data_len;
+                held += seg.data_len;
+            }
+            assert_eq!(held, s.socket.zc_held_bytes, "held bytes");
+            assert!(s.socket.zc_contiguous_bytes <= held, "contiguous vs held");
+        }
+
+        #[test]
+        fn a_gap_filling_retransmit_that_overlaps_held_segments_is_reconciled() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // The left edge is missing and three one-byte segments are held.
+            for i in 1..=3usize {
+                feed(&mut s, i, b"x", i as u8);
+            }
+            assert_eq!(s.socket.zc_segment_count, 3);
+
+            // Go-back-N: the retransmission resends from the left edge and
+            // covers everything already held.
+            feed(&mut s, 0, b"abcd", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_contiguous_bytes, 4);
+
+            // The superseded descriptors are handed back rather than leaked.
+            assert_eq!(released_handles().len(), 3);
+
+            let mut seen = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(consumed, 4);
+            assert_eq!(seen.len(), 4);
+            assert_eq!(s.socket.zc_segment_count, 0);
+            assert_eq!(s.socket.zc_held_bytes, 0);
+        }
+
+        #[test]
+        fn a_retransmit_overlapping_only_the_tail_of_a_gap_is_trimmed() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // A hole at [0, 4) with a four-byte segment behind it.
+            feed(&mut s, 4, b"wxyz", 4);
+            assert_eq!(s.socket.zc_segment_count, 1);
+
+            // A retransmission spanning the hole and the first two bytes of
+            // the held segment. Neither covers the other, so the new one is
+            // trimmed and both are kept.
+            feed(&mut s, 0, b"abcdef", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_segment_count, 2);
+            assert_eq!(s.socket.zc_segments[0].data_len, 4);
+            assert_eq!(s.socket.zc_contiguous_bytes, 8);
+            assert_eq!(released_handles().len(), 0);
+
+            let mut seen = Vec::new();
+            let consumed = s
+                .socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(consumed, 8);
+            assert_eq!(&seen, b"abcdwxyz");
+        }
+
+        #[test]
+        fn a_retransmit_overlapping_only_the_head_of_a_gap_is_trimmed() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // A hole at [0, 2) keeps the held segment off the contiguous
+            // frontier, so the window check leaves the incoming payload alone
+            // and the overlap is the descriptor array's to resolve.
+            feed(&mut s, 2, b"cdef", 2);
+            assert_eq!(s.socket.zc_contiguous_bytes, 0);
+
+            // A retransmission starting inside the held segment and running
+            // past its end keeps the held bytes and stores only the new tail.
+            feed(&mut s, 4, b"efgh", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_segment_count, 2);
+            assert_eq!(s.socket.zc_segments[1].stream_offset, 6);
+            assert_eq!(s.socket.zc_segments[1].data_len, 2);
+            assert_eq!(released_handles().len(), 0);
+
+            // Filling the hole makes the whole run contiguous and readable.
+            feed(&mut s, 0, b"ab", 0);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_contiguous_bytes, 8);
+
+            let mut seen = Vec::new();
+            s.socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(&seen, b"abcdefgh");
+        }
+
+        #[test]
+        fn an_exact_duplicate_of_a_held_segment_is_dropped() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            feed(&mut s, 1, b"xy", 1);
+            feed(&mut s, 1, b"xy", 0x40);
+
+            // No second descriptor, and the duplicate's frame is left to the
+            // transport's batch recycle rather than retained or released.
+            assert_eq!(s.socket.zc_segment_count, 1);
+            assert_eq!(s.socket.zc_held_bytes, 2);
+            assert_eq!(released_handles().len(), 0);
+            assert_descriptors_tile(&s);
+        }
+
+        #[test]
+        fn a_retransmit_contained_in_a_held_segment_is_dropped() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            feed(&mut s, 1, b"vwxyz", 1);
+            feed(&mut s, 2, b"wx", 0x40);
+
+            assert_eq!(s.socket.zc_segment_count, 1);
+            assert_eq!(s.socket.zc_held_bytes, 5);
+            assert_descriptors_tile(&s);
+        }
+
+        #[test]
+        fn a_retransmit_spanning_several_held_segments_supersedes_them_all() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            // Two out-of-order islands with holes on either side of them.
+            feed(&mut s, 2, b"cd", 2);
+            feed(&mut s, 6, b"gh", 6);
+            assert_eq!(s.socket.zc_segment_count, 2);
+
+            // One retransmission covering both islands and every hole.
+            feed(&mut s, 0, b"abcdefghij", 0x40);
+            assert_descriptors_tile(&s);
+            assert_eq!(s.socket.zc_segment_count, 1);
+            assert_eq!(s.socket.zc_contiguous_bytes, 10);
+            assert_eq!(released_handles().len(), 2);
+
+            let mut seen = Vec::new();
+            s.socket
+                .recv_zero_copy(|b| {
+                    seen.extend_from_slice(b);
+                    b.len()
+                })
+                .unwrap();
+            assert_eq!(&seen, b"abcdefghij");
+        }
+
+        /// A deterministic xorshift64, so a failing case is reproducible from
+        /// the seed printed in the assertion. `rand::thread_rng` would not be.
+        struct Xorshift(u64);
+
+        impl Xorshift {
+            fn below(&mut self, n: usize) -> usize {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                // Modulo bias is irrelevant for choosing test offsets.
+                (x % n as u64) as usize
+            }
+        }
+
+        #[test]
+        fn random_overlapping_arrivals_keep_the_descriptor_array_consistent() {
+            // The reconciliation locates overlaps by binary search, which is
+            // only equivalent to an exhaustive scan while the array stays
+            // sorted and non-overlapping. `process_data_segment_zero_copy`
+            // cross-checks both searches against a linear pass under
+            // `debug_assertions`, so what this test adds is reach: far more
+            // overlap shapes than the hand-written cases above cover.
+            const STREAM: usize = 200;
+            const MAX_LEN: usize = 16;
+
+            // One buffer for the whole test, because descriptors keep a raw
+            // pointer into whatever payload was fed and `recv_zero_copy`
+            // dereferences it. Byte value is the stream offset truncated, so
+            // a misplaced trim surfaces as wrong content rather than only as
+            // a broken counter.
+            let stream: [u8; STREAM] = core::array::from_fn(|i| i as u8);
+
+            for seed in 1..=64u64 {
+                clear_released();
+                let mut s = socket_with_binding_slot_bound();
+                let mut rng = Xorshift(seed);
+
+                for _ in 0..40 {
+                    let offset = rng.below(STREAM - MAX_LEN);
+                    let len = rng.below(MAX_LEN) + 1;
+                    feed(&mut s, offset, &stream[offset..offset + len], 0);
+                    assert_descriptors_tile(&s);
+                }
+
+                // Whatever became contiguous must read back as the stream's
+                // own bytes, in order, from zero.
+                let mut next = 0usize;
+                let drained = s
+                    .socket
+                    .recv_zero_copy(|data| {
+                        for (i, byte) in data.iter().enumerate() {
+                            assert_eq!(
+                                *byte,
+                                (next + i) as u8,
+                                "seed {seed}: wrong byte at stream offset {}",
+                                next + i
+                            );
+                        }
+                        next += data.len();
+                        data.len()
+                    })
+                    .unwrap();
+                assert_eq!(drained, next, "seed {seed}");
+                assert_descriptors_tile(&s);
+            }
+        }
+
+        #[test]
+        fn window_reopens_once_segments_are_consumed() {
+            clear_released();
+            let mut s = socket_with_binding_slot_bound();
+
+            fill_slots(&mut s, crate::config::ZERO_COPY_RX_MAX_SEGMENTS);
+            assert_eq!(s.socket.scaled_window(), 0);
+
+            // Actually tell the peer to stop, rather than only computing that
+            // it should: reopening is only observable against an
+            // advertisement that went out.
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert_eq!(repr.unwrap().window_len, 0);
+            });
+
+            while s.socket.recv_zero_copy(|slice| slice.len()).unwrap() != 0 {}
+
+            assert_eq!(s.socket.scaled_window(), 2048);
+            // And the reopening is worth nothing until the peer is told, so
+            // the socket must consider the update worth sending.
+            assert!(s.socket.window_to_update());
+            recv(&mut s, Instant::from_millis(0), |repr| {
+                assert_eq!(repr.unwrap().window_len, 2048);
+            });
         }
     }
 }

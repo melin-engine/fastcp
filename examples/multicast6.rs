@@ -2,12 +2,12 @@ mod utils;
 
 use std::os::unix::io::AsRawFd;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::wait as phy_wait;
-use smoltcp::phy::{Device, Medium};
-use smoltcp::socket::udp;
-use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv6Address};
+use fastcp::iface::{Config, Interface, SocketSet};
+use fastcp::phy::wait as phy_wait;
+use fastcp::phy::{Device, Medium};
+use fastcp::socket::udp;
+use fastcp::time::Instant;
+use fastcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv6Address};
 
 // Note: If testing with a tap interface in linux, you may need to specify the
 // interface index when addressing. E.g.,
@@ -40,7 +40,7 @@ fn main() {
     let ethernet_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
     let mut config = match device.capabilities().medium {
         Medium::Ethernet => Config::new(ethernet_addr.into()),
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ip => Config::new(fastcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
     config.random_seed = rand::random();

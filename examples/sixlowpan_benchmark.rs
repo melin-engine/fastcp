@@ -46,13 +46,13 @@ mod utils;
 use std::os::unix::io::AsRawFd;
 use std::str;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::{Device, Medium, RawSocket, wait as phy_wait};
-use smoltcp::socket::tcp;
-use smoltcp::wire::{EthernetAddress, Ieee802154Address, Ieee802154Pan, IpAddress, IpCidr};
+use fastcp::iface::{Config, Interface, SocketSet};
+use fastcp::phy::{Device, Medium, RawSocket, wait as phy_wait};
+use fastcp::socket::tcp;
+use fastcp::wire::{EthernetAddress, Ieee802154Address, Ieee802154Pan, IpAddress, IpCidr};
 
 //For benchmark
-use smoltcp::time::{Duration, Instant};
+use fastcp::time::{Duration, Instant};
 use std::cmp;
 use std::io::{Read, Write};
 use std::net::SocketAddrV6;
@@ -151,7 +151,7 @@ fn main() {
         Medium::Ethernet => {
             Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
         }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ip => Config::new(fastcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => Config::new(
             Ieee802154Address::Extended([0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42]).into(),
         ),

@@ -294,7 +294,7 @@ impl InterfaceInner {
                 // We fill from requests too because if someone is requesting our address they
                 // are probably going to talk to us, so we avoid having to request their address
                 // when we later reply to them.
-                self.neighbor_cache.fill(
+                self.fill_neighbor_cache(
                     source_protocol_addr.into(),
                     source_hardware_addr.into(),
                     timestamp,

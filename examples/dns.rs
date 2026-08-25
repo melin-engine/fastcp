@@ -1,11 +1,11 @@
 mod utils;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::Device;
-use smoltcp::phy::{Medium, wait as phy_wait};
-use smoltcp::socket::dns::{self, GetQueryResultError};
-use smoltcp::time::Instant;
-use smoltcp::wire::{DnsQueryType, EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
+use fastcp::iface::{Config, Interface, SocketSet};
+use fastcp::phy::Device;
+use fastcp::phy::{Medium, wait as phy_wait};
+use fastcp::socket::dns::{self, GetQueryResultError};
+use fastcp::time::Instant;
+use fastcp::wire::{DnsQueryType, EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use std::os::unix::io::AsRawFd;
 
 fn main() {
@@ -28,7 +28,7 @@ fn main() {
         Medium::Ethernet => {
             Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
         }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ip => Config::new(fastcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
     config.random_seed = rand::random();

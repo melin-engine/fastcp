@@ -37,8 +37,13 @@ fn hash_ip_addr(h: usize, addr: &IpAddress) -> usize {
     }
 }
 
-/// Maximum number of indexed TCP connections. Must be a power of two.
-/// Connections beyond this count fall back to the linear scan.
+/// Slot count of the open-addressing table. Must be a power of two.
+///
+/// Insertion stops at a 50 % load factor to keep probe chains short, so this
+/// admits `CAPACITY / 2` *live* connections; further ones fall back to the
+/// linear scan for their whole lifetime. It is a live ceiling rather than a
+/// cumulative one only because closed sockets are evicted — see
+/// [`Interface::forget_tcp_socket`](crate::iface::Interface::forget_tcp_socket).
 const CAPACITY: usize = 128;
 
 /// A 4-tuple key identifying a TCP connection.
@@ -85,6 +90,12 @@ impl TcpSocketIndex {
             slots: [Slot::Empty; CAPACITY],
             len: 0,
         }
+    }
+
+    /// Number of live entries. Insertion stops at half of [`CAPACITY`].
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
     /// Look up a socket handle by 4-tuple. Returns `None` if not indexed.
@@ -136,7 +147,7 @@ impl TcpSocketIndex {
         for _ in 0..CAPACITY {
             match &self.slots[idx] {
                 Slot::Empty => {
-                    if self.len >= CAPACITY / 2 {
+                    if self.len() >= CAPACITY / 2 {
                         // Keep load factor below 50% for performance.
                         return false;
                     }
@@ -208,25 +219,154 @@ impl TcpSocketIndex {
         }
     }
 
-    /// Remove all entries referencing a given socket handle.
+    /// Remove every entry referencing a given socket handle.
+    ///
+    /// A handle can appear more than once: `SocketSet` recycles indices, so a
+    /// closed connection's entry and its successor's entry may both name the
+    /// same handle until the stale one is evicted. Removing only the first
+    /// match found in slot order can drop the live entry and keep the stale
+    /// one, so this drains all of them.
     pub(crate) fn remove_by_handle(&mut self, handle: SocketHandle) {
-        // Simple approach: scan and rebuild. Called rarely (socket close).
-        for i in 0..CAPACITY {
-            if let Slot::Occupied(_, h) = &self.slots[i]
-                && *h == handle
-            {
-                let key = match self.slots[i] {
-                    Slot::Occupied(k, _) => k,
-                    _ => unreachable!(),
-                };
-                self.remove(
-                    key.local_addr,
-                    key.local_port,
-                    key.remote_addr,
-                    key.remote_port,
-                );
-                return;
-            }
+        // `remove` performs backward-shift deletion, which moves later entries
+        // into earlier slots — including slots this scan has already passed.
+        // Restarting after each removal is the simple correct answer; this runs
+        // on socket close, not on the packet path.
+        loop {
+            let found = self.slots.iter().find_map(|slot| match slot {
+                Slot::Occupied(key, h) if *h == handle => Some(*key),
+                _ => None,
+            });
+            let Some(key) = found else { return };
+            self.remove(
+                key.local_addr,
+                key.local_port,
+                key.remote_addr,
+                key.remote_port,
+            );
+        }
+    }
+}
+
+#[cfg(all(test, any(feature = "proto-ipv4", feature = "proto-ipv6")))]
+mod test {
+    use super::*;
+
+    // The index is protocol-agnostic, but `IpAddress::v4` only exists under
+    // `proto-ipv4` and `IpAddress::v6` only under `proto-ipv6`, so the
+    // addresses are built through helpers that follow whichever is enabled.
+    // Every feature combination that compiles this module has at least one.
+    #[cfg(feature = "proto-ipv4")]
+    const LOCAL: IpAddress = IpAddress::v4(10, 0, 0, 1);
+    #[cfg(not(feature = "proto-ipv4"))]
+    const LOCAL: IpAddress = IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+
+    /// A distinct remote address per 256 values of `n`.
+    #[cfg(feature = "proto-ipv4")]
+    const fn remote_nth(n: usize) -> IpAddress {
+        IpAddress::v4(10, 0, 1, (n / 256) as u8)
+    }
+    #[cfg(not(feature = "proto-ipv4"))]
+    const fn remote_nth(n: usize) -> IpAddress {
+        IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 1, (n / 256) as u16)
+    }
+
+    /// A distinct 4-tuple per `n`, all sharing the local endpoint.
+    fn insert_nth(index: &mut TcpSocketIndex, n: usize, handle: usize) -> bool {
+        index.insert(
+            LOCAL,
+            80,
+            remote_nth(n),
+            (n % 256) as u16 + 1024,
+            SocketHandle::from_index(handle),
+        )
+    }
+
+    fn get_nth(index: &TcpSocketIndex, n: usize) -> Option<SocketHandle> {
+        index.get(LOCAL, 80, remote_nth(n), (n % 256) as u16 + 1024)
+    }
+
+    #[test]
+    fn insert_and_get_round_trip() {
+        let mut index = TcpSocketIndex::new();
+        assert!(insert_nth(&mut index, 0, 7));
+
+        assert_eq!(get_nth(&index, 0), Some(SocketHandle::from_index(7)));
+        assert_eq!(get_nth(&index, 1), None);
+    }
+
+    #[test]
+    fn insert_refuses_past_half_capacity() {
+        let mut index = TcpSocketIndex::new();
+        for n in 0..CAPACITY / 2 {
+            assert!(insert_nth(&mut index, n, n), "insert {n} should fit");
+        }
+
+        assert!(!insert_nth(&mut index, CAPACITY / 2, 0));
+    }
+
+    #[test]
+    fn remove_by_handle_drains_every_entry_for_that_handle() {
+        let mut index = TcpSocketIndex::new();
+        // The state left behind when `SocketSet` recycles a slab index: the
+        // closed connection's entry and its successor's entry name one handle.
+        assert!(insert_nth(&mut index, 0, 3));
+        assert!(insert_nth(&mut index, 1, 3));
+
+        index.remove_by_handle(SocketHandle::from_index(3));
+
+        assert_eq!(get_nth(&index, 0), None);
+        assert_eq!(get_nth(&index, 1), None);
+        assert_eq!(index.len, 0);
+    }
+
+    #[test]
+    fn remove_by_handle_leaves_other_handles_alone() {
+        let mut index = TcpSocketIndex::new();
+        assert!(insert_nth(&mut index, 0, 3));
+        assert!(insert_nth(&mut index, 1, 4));
+
+        index.remove_by_handle(SocketHandle::from_index(3));
+
+        assert_eq!(get_nth(&index, 0), None);
+        assert_eq!(get_nth(&index, 1), Some(SocketHandle::from_index(4)));
+    }
+
+    #[test]
+    fn eviction_makes_capacity_a_live_ceiling_not_a_lifetime_one() {
+        let mut index = TcpSocketIndex::new();
+
+        // Many sequential connection lifetimes, never more than one live at a
+        // time. Without eviction the table fills after CAPACITY / 2 of these
+        // and every later connection goes unindexed forever.
+        for n in 0..CAPACITY * 4 {
+            assert!(insert_nth(&mut index, n, 1), "lifetime {n} should index");
+            assert_eq!(get_nth(&index, n), Some(SocketHandle::from_index(1)));
+            index.remove_by_handle(SocketHandle::from_index(1));
+        }
+
+        assert_eq!(index.len, 0);
+    }
+
+    #[test]
+    fn removal_preserves_probe_chains() {
+        let mut index = TcpSocketIndex::new();
+        for n in 0..CAPACITY / 2 {
+            assert!(insert_nth(&mut index, n, n));
+        }
+
+        // Drop every other entry, then confirm the survivors are still
+        // reachable through the probe chains the deletions rewrote.
+        for n in (0..CAPACITY / 2).step_by(2) {
+            index.remove_by_handle(SocketHandle::from_index(n));
+        }
+
+        for n in 0..CAPACITY / 2 {
+            let expected = if n % 2 == 0 {
+                None
+            } else {
+                Some(SocketHandle::from_index(n))
+            };
+            assert_eq!(get_nth(&index, n), expected, "entry {n}");
         }
     }
 }

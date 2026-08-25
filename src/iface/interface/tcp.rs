@@ -2,7 +2,52 @@ use super::*;
 
 #[cfg(feature = "socket-tcp-zero-copy-rx")]
 use crate::socket::tcp::OpaqueFrameHandle;
-use crate::socket::tcp::Socket;
+use crate::socket::tcp::{Socket, State};
+
+/// Whether the index entry for `tuple` is dead weight now that the socket has
+/// processed a segment for it.
+///
+/// The test is tuple ownership rather than state, because the ways a socket
+/// stops owning a 4-tuple do not share a single terminal state: an inbound RST
+/// in SYN-RECEIVED puts a listening socket back in `Listen`, the final ACK of
+/// LAST-ACK reaches `Closed`, and a `SocketSet` slot can be recycled into a
+/// connection with an entirely different tuple.
+///
+/// `TimeWait` is evicted even though the socket still owns the tuple. It has
+/// to re-ACK a retransmitted FIN for 2MSL, which the linear scan does perfectly
+/// well; holding an index slot for the whole of 2MSL is exactly the occupancy
+/// the table cannot afford.
+#[inline]
+fn index_entry_is_dead(
+    socket: &Socket,
+    local_addr: IpAddress,
+    local_port: u16,
+    remote_addr: IpAddress,
+    remote_port: u16,
+) -> bool {
+    if matches!(socket.state(), State::Closed | State::TimeWait) {
+        return true;
+    }
+    match (socket.local_endpoint(), socket.remote_endpoint()) {
+        // Unreachable from either call site today: both are gated on
+        // `accepts`, which demands an exact 4-tuple match from any socket that
+        // has a tuple, and `process` only ever adopts the tuple of the segment
+        // it just accepted. Kept because the tuple arrives here as four loose
+        // parameters, which invites a future caller that is not so gated —
+        // and because a silent mismatch would index a live connection under
+        // another connection's key.
+        (Some(local), Some(remote)) => {
+            local.addr != local_addr
+                || local.port != local_port
+                || remote.addr != remote_addr
+                || remote.port != remote_port
+        }
+        // Not connected: a listening socket, or one that just lost its tuple.
+        // Both endpoints read the same `tuple`, so this is the only other
+        // shape the pair can take.
+        _ => true,
+    }
+}
 
 impl InterfaceInner {
     pub(crate) fn process_tcp<'frame>(
@@ -43,17 +88,54 @@ impl InterfaceInner {
                 && tcp_socket.accepts(self, &ip_repr, &tcp_repr)
             {
                 #[cfg(feature = "socket-tcp-zero-copy-rx")]
-                if let Some(fh) = zc_handle {
-                    return tcp_socket
+                let result = if let Some(fh) = zc_handle {
+                    tcp_socket
                         .process_zero_copy(self, &ip_repr, &tcp_repr, fh)
-                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
-                }
-                return tcp_socket
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)))
+                } else {
+                    tcp_socket
+                        .process(self, &ip_repr, &tcp_repr)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)))
+                };
+                #[cfg(not(feature = "socket-tcp-zero-copy-rx"))]
+                let result = tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+
+                // Give the slot back as soon as the connection is over. The
+                // application is free to re-`listen` on this socket without
+                // ever removing it from the `SocketSet` — the documented
+                // idiom — in which case `forget_tcp_socket` is never called
+                // and nothing else would evict this entry: the peer's
+                // ephemeral port does not recur, so no later segment carries
+                // this 4-tuple to trigger the stale-entry path above.
+                if index_entry_is_dead(
+                    tcp_socket,
+                    ip_repr.dst_addr(),
+                    tcp_repr.dst_port,
+                    ip_repr.src_addr(),
+                    tcp_repr.src_port,
+                ) {
+                    self.tcp_socket_index.remove(
+                        ip_repr.dst_addr(),
+                        tcp_repr.dst_port,
+                        ip_repr.src_addr(),
+                        tcp_repr.src_port,
+                    );
+                }
+                return result;
             }
-            // Index stale — remove and fall through to linear scan.
-            self.tcp_socket_index.remove_by_handle(handle);
+            // Index stale — remove and fall through to linear scan. Evict the
+            // exact key that just missed, not everything pointing at `handle`:
+            // once `SocketSet` recycles the index, the live connection on that
+            // handle has its own entry, and removing by handle can take the
+            // live one and leave this stale one in place.
+            self.tcp_socket_index.remove(
+                ip_repr.dst_addr(),
+                tcp_repr.dst_port,
+                ip_repr.src_addr(),
+                tcp_repr.src_port,
+            );
         }
 
         // Slow path: linear scan for LISTEN sockets and unindexed connections.
@@ -78,8 +160,22 @@ impl InterfaceInner {
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
 
-                // Index this connection for future O(1) lookups.
-                if let (Some(local), Some(remote)) =
+                // Index this connection for future O(1) lookups, or give the
+                // slot back if this segment is what ended it.
+                if index_entry_is_dead(
+                    tcp_socket,
+                    ip_repr.dst_addr(),
+                    tcp_repr.dst_port,
+                    ip_repr.src_addr(),
+                    tcp_repr.src_port,
+                ) {
+                    self.tcp_socket_index.remove(
+                        ip_repr.dst_addr(),
+                        tcp_repr.dst_port,
+                        ip_repr.src_addr(),
+                        tcp_repr.src_port,
+                    );
+                } else if let (Some(local), Some(remote)) =
                     (tcp_socket.local_endpoint(), tcp_socket.remote_endpoint())
                 {
                     self.tcp_socket_index.insert(
