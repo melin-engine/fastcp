@@ -45,8 +45,8 @@ To emit an IP packet header into an octet buffer, and then parse it back:
 ```rust
 # #[cfg(feature = "proto-ipv4")]
 # {
-use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::*;
+use fastcp::phy::ChecksumCapabilities;
+use fastcp::wire::*;
 let repr = Ipv4Repr {
     src_addr:    Ipv4Address::new(10, 0, 0, 1),
     dst_addr:    Ipv4Address::new(10, 0, 0, 2),

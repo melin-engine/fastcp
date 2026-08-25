@@ -4,11 +4,11 @@ mod utils;
 use log::*;
 use std::os::unix::io::AsRawFd;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::dhcpv4;
-use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
-use smoltcp::{
+use fastcp::iface::{Config, Interface, SocketSet};
+use fastcp::socket::dhcpv4;
+use fastcp::time::Instant;
+use fastcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
+use fastcp::{
     phy::{Device, Medium, wait as phy_wait},
     time::Duration,
 };
@@ -32,7 +32,7 @@ fn main() {
         Medium::Ethernet => {
             Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
         }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ip => Config::new(fastcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
     config.random_seed = rand::random();

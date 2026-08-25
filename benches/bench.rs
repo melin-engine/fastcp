@@ -1,14 +1,14 @@
 #![feature(test)]
 
 mod wire {
-    use smoltcp::phy::ChecksumCapabilities;
-    use smoltcp::wire::{IpAddress, IpProtocol};
+    use fastcp::phy::ChecksumCapabilities;
+    use fastcp::wire::{IpAddress, IpProtocol};
     #[cfg(feature = "proto-ipv4")]
-    use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr};
+    use fastcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr};
     #[cfg(feature = "proto-ipv6")]
-    use smoltcp::wire::{Ipv6Address, Ipv6Packet, Ipv6Repr};
-    use smoltcp::wire::{TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
-    use smoltcp::wire::{UdpPacket, UdpRepr};
+    use fastcp::wire::{Ipv6Address, Ipv6Packet, Ipv6Repr};
+    use fastcp::wire::{TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
+    use fastcp::wire::{UdpPacket, UdpRepr};
 
     extern crate test;
 

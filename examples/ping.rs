@@ -1,21 +1,21 @@
 mod utils;
 
 use byteorder::{ByteOrder, NetworkEndian};
-use smoltcp::iface::{Interface, SocketSet};
+use fastcp::iface::{Interface, SocketSet};
 use std::cmp;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::str::FromStr;
 
-use smoltcp::iface::Config;
-use smoltcp::phy::Device;
-use smoltcp::phy::wait as phy_wait;
-use smoltcp::socket::icmp;
-use smoltcp::wire::{
+use fastcp::iface::Config;
+use fastcp::phy::Device;
+use fastcp::phy::wait as phy_wait;
+use fastcp::socket::icmp;
+use fastcp::wire::{
     EthernetAddress, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr,
     Ipv4Address, Ipv6Address,
 };
-use smoltcp::{
+use fastcp::{
     phy::Medium,
     time::{Duration, Instant},
 };
@@ -109,7 +109,7 @@ fn main() {
         Medium::Ethernet => {
             Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
         }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ip => Config::new(fastcp::wire::HardwareAddress::Ip),
         Medium::Ieee802154 => todo!(),
     };
     config.random_seed = rand::random();

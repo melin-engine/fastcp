@@ -1427,9 +1427,9 @@ impl<'a> Socket<'a> {
     /// #     feature = "proto-ipv4",
     /// # ))]
     /// # {
-    /// # use smoltcp::socket::tcp::{Socket, SocketBuffer};
-    /// # use smoltcp::iface::Interface;
-    /// # use smoltcp::wire::IpAddress;
+    /// # use fastcp::socket::tcp::{Socket, SocketBuffer};
+    /// # use fastcp::iface::Interface;
+    /// # use fastcp::wire::IpAddress;
     /// #
     /// # fn get_ephemeral_port() -> u16 {
     /// #     49152

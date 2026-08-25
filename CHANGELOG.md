@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - ci
+    - Fix the `smoltcp` → `fastcp` crate rename in the examples, benches, `utils/packet2pcap.rs`, the netsim test, and the doctests in `src/`. None of these compiled, so `ci.sh test`, `check`, `clippy` and `netsim` all aborted before running anything — `cargo test --lib` was the only thing that worked, which is why 7 broken doctests went unseen. `examples/utils.rs` also filtered log records on a `smoltcp::` target prefix that the crate no longer emits, silently discarding every line.
     - Cover `socket-tcp-zero-copy-rx` in the test and check matrices. It is in neither the default feature set nor any prior combo, so nothing in CI compiled the zero-copy paths, let alone ran their tests. The check combos also compile the shipped `ZERO_COPY_RX_MAX_SEGMENTS`, which `cargo test` never sees: the test build substitutes a hardcoded config that pins it to 32.
 - iface
     - Add `Interface::forget_tcp_socket`, which drops the TCP 4-tuple index entries for a socket handle. Without it the index never learns about `SocketSet` removals, so closed connections hold their slots forever and — once the table reaches its insert limit — every subsequent connection stays unindexed for its whole life and falls back to a linear scan per segment.
