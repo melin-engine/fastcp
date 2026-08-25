@@ -6,6 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Drop support for 16-bit pointer targets, and with it the `build_16bit` CI stage. fastcp targets x86-64 with DPDK; the stage had been failing since the O(1) socket index landed in March, went unnoticed for 33 commits because it was marked `continue-on-error` and was absent from the aggregate job's `needs`, and in exchange constrained every `usize` decision on the hot path. It was the only consumer of nightly `-Z build-std` and the tier-3 `msp430-none-elf` target.
 - ci
     - Fix the `smoltcp` → `fastcp` crate rename in the examples, benches, `utils/packet2pcap.rs`, the netsim test, and the doctests in `src/`. None of these compiled, so `ci.sh test`, `check`, `clippy` and `netsim` all aborted before running anything — `cargo test --lib` was the only thing that worked, which is why 7 broken doctests went unseen. `examples/utils.rs` also filtered log records on a `smoltcp::` target prefix that the crate no longer emits, silently discarding every line.
     - Cover `socket-tcp-zero-copy-rx` in the test and check matrices. It is in neither the default feature set nor any prior combo, so nothing in CI compiled the zero-copy paths, let alone ran their tests. The check combos also compile the shipped `ZERO_COPY_RX_MAX_SEGMENTS`, which `cargo test` never sees: the test build substitutes a hardcoded config that pins it to 32.

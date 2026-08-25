@@ -751,7 +751,6 @@ impl<'a> Socket<'a> {
         // [...] the above constraints imply that 2 * the max window size must be less
         // than 2**31 [...] Thus, the shift count must be limited to 14 (which allows
         // windows of 2**30 = 1 Gbyte).
-        #[cfg(not(target_pointer_width = "16"))] // Prevent overflow
         if rx_capacity > (1 << 30) {
             panic!("receiving buffer too large, cannot exceed 1 GiB")
         }
