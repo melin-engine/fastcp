@@ -3371,17 +3371,62 @@ impl<'a> Socket<'a> {
             // released and re-retained for no gain.
             let abs_start = self.zc_contiguous_bytes + payload_offset;
             let abs_end = abs_start + payload.len();
+
+            // Sorted and non-overlapping means offsets and ends both increase
+            // monotonically, so each lookup below is a `partition_point`
+            // rather than a scan. That is not a micro-optimisation: a full
+            // pass per lookup would put unconditional O(descriptors) work on
+            // the in-order arrival path, which is otherwise O(1) — the insert
+            // below binary-searches too, and its `copy_within` is a no-op for
+            // an append. The array is sized for hundreds of descriptors
+            // queued behind a lagging application, which is exactly when that
+            // path must stay cheap.
+            let held = &self.zc_segments[..self.zc_segment_count];
+
+            // The last descriptor starting at or before `abs_start` is the
+            // only one that can contain it.
             let mut trim_start = abs_start;
+            let head = held.partition_point(|seg| seg.stream_offset <= abs_start);
+            if head > 0 {
+                let seg = &held[head - 1];
+                if abs_start < seg.stream_offset + seg.data_len {
+                    trim_start = seg.stream_offset + seg.data_len;
+                }
+            }
+
+            // Likewise, the last descriptor starting before `abs_end` is the
+            // only one that can extend past it.
             let mut trim_end = abs_end;
-            for i in 0..self.zc_segment_count {
-                let held_start = self.zc_segments[i].stream_offset;
-                let held_end = held_start + self.zc_segments[i].data_len;
-                if held_start <= abs_start && abs_start < held_end {
-                    trim_start = held_end;
+            let tail = held.partition_point(|seg| seg.stream_offset < abs_end);
+            if tail > 0 {
+                let seg = &held[tail - 1];
+                if abs_end < seg.stream_offset + seg.data_len {
+                    trim_end = seg.stream_offset;
                 }
-                if held_start < abs_end && abs_end < held_end {
-                    trim_end = held_start;
+            }
+
+            // The searches are only equivalent to an exhaustive scan while the
+            // array really is sorted and non-overlapping. That invariant is
+            // maintained here and in `recv_zero_copy`, several hundred lines
+            // apart, so it is cross-checked rather than assumed.
+            #[cfg(debug_assertions)]
+            {
+                let (mut scan_start, mut scan_end) = (abs_start, abs_end);
+                for seg in held {
+                    let (seg_start, seg_end) =
+                        (seg.stream_offset, seg.stream_offset + seg.data_len);
+                    if seg_start <= abs_start && abs_start < seg_end {
+                        scan_start = seg_end;
+                    }
+                    if seg_start < abs_end && abs_end < seg_end {
+                        scan_end = seg_start;
+                    }
                 }
+                debug_assert_eq!(
+                    (trim_start, trim_end),
+                    (scan_start, scan_end),
+                    "binary-searched overlap trim disagrees with a linear scan"
+                );
             }
 
             if trim_start >= trim_end {
@@ -3392,17 +3437,27 @@ impl<'a> Socket<'a> {
                 return DataSegmentResult::Ok;
             }
 
-            // Descriptors the stored range will fully cover. Counted here
-            // because they free slots, and so belong in the capacity check
-            // below; they are actually released further down, once every
-            // fallible step has succeeded.
-            let covered = |seg: &ZeroCopySegment| {
-                trim_start <= seg.stream_offset && seg.stream_offset + seg.data_len <= trim_end
-            };
-            let evicted = self.zc_segments[..self.zc_segment_count]
-                .iter()
-                .filter(|seg| covered(seg))
-                .count();
+            // Descriptors the stored range will fully cover. They form one
+            // contiguous run: `stream_offset >= trim_start` selects a suffix
+            // of the array and `end <= trim_end` a prefix, so the two bounds
+            // intersect in a single slice. Located here because the slots
+            // they free belong in the capacity check below; they are actually
+            // released further down, once every fallible step has succeeded.
+            let evict_from = held.partition_point(|seg| seg.stream_offset < trim_start);
+            // `partition_point` on the end bound can land before `evict_from`
+            // when nothing is covered, so the run is clamped to empty.
+            let evict_to = held
+                .partition_point(|seg| seg.stream_offset + seg.data_len <= trim_end)
+                .max(evict_from);
+            let evicted = evict_to - evict_from;
+            debug_assert_eq!(
+                evicted,
+                held.iter()
+                    .filter(|seg| trim_start <= seg.stream_offset
+                        && seg.stream_offset + seg.data_len <= trim_end)
+                    .count(),
+                "binary-searched eviction run disagrees with a linear scan"
+            );
 
             let payload = &payload[trim_start - abs_start..trim_end - abs_start];
             let payload_len = payload.len();
@@ -3469,21 +3524,18 @@ impl<'a> Socket<'a> {
             // `trim_start` is at or past the frontier, and so is every offset
             // at or past `trim_start`.
             if evicted > 0 {
-                let mut write = 0;
-                for read in 0..self.zc_segment_count {
-                    let held = self.zc_segments[read];
-                    if covered(&held) {
-                        if let Some(release_fn) = self.zc_release_fn {
-                            release_fn(held.frame_handle);
-                        }
-                        self.zc_held_bytes -= held.data_len;
-                        continue;
+                for i in evict_from..evict_to {
+                    let seg = self.zc_segments[i];
+                    if let Some(release_fn) = self.zc_release_fn {
+                        release_fn(seg.frame_handle);
                     }
-                    self.zc_segments[write] = held;
-                    write += 1;
+                    self.zc_held_bytes -= seg.data_len;
                 }
-                debug_assert_eq!(write, self.zc_segment_count - evicted);
-                self.zc_segment_count = write;
+                // One contiguous run, so closing the hole is a single move of
+                // the tail rather than a compaction pass.
+                let count = self.zc_segment_count;
+                self.zc_segments.copy_within(evict_to..count, evict_from);
+                self.zc_segment_count = count - evicted;
             }
 
             // The absolute stream offset of the bytes actually stored:
@@ -11528,6 +11580,75 @@ mod test {
                 })
                 .unwrap();
             assert_eq!(&seen, b"abcdefghij");
+        }
+
+        /// A deterministic xorshift64, so a failing case is reproducible from
+        /// the seed printed in the assertion. `rand::thread_rng` would not be.
+        struct Xorshift(u64);
+
+        impl Xorshift {
+            fn below(&mut self, n: usize) -> usize {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                // Modulo bias is irrelevant for choosing test offsets.
+                (x % n as u64) as usize
+            }
+        }
+
+        #[test]
+        fn random_overlapping_arrivals_keep_the_descriptor_array_consistent() {
+            // The reconciliation locates overlaps by binary search, which is
+            // only equivalent to an exhaustive scan while the array stays
+            // sorted and non-overlapping. `process_data_segment_zero_copy`
+            // cross-checks both searches against a linear pass under
+            // `debug_assertions`, so what this test adds is reach: far more
+            // overlap shapes than the hand-written cases above cover.
+            const STREAM: usize = 200;
+            const MAX_LEN: usize = 16;
+
+            // One buffer for the whole test, because descriptors keep a raw
+            // pointer into whatever payload was fed and `recv_zero_copy`
+            // dereferences it. Byte value is the stream offset truncated, so
+            // a misplaced trim surfaces as wrong content rather than only as
+            // a broken counter.
+            let stream: [u8; STREAM] = core::array::from_fn(|i| i as u8);
+
+            for seed in 1..=64u64 {
+                clear_released();
+                let mut s = socket_with_binding_slot_bound();
+                let mut rng = Xorshift(seed);
+
+                for _ in 0..40 {
+                    let offset = rng.below(STREAM - MAX_LEN);
+                    let len = rng.below(MAX_LEN) + 1;
+                    feed(&mut s, offset, &stream[offset..offset + len], 0);
+                    assert_descriptors_tile(&s);
+                }
+
+                // Whatever became contiguous must read back as the stream's
+                // own bytes, in order, from zero.
+                let mut next = 0usize;
+                let drained = s
+                    .socket
+                    .recv_zero_copy(|data| {
+                        for (i, byte) in data.iter().enumerate() {
+                            assert_eq!(
+                                *byte,
+                                (next + i) as u8,
+                                "seed {seed}: wrong byte at stream offset {}",
+                                next + i
+                            );
+                        }
+                        next += data.len();
+                        data.len()
+                    })
+                    .unwrap();
+                assert_eq!(drained, next, "seed {seed}");
+                assert_descriptors_tile(&s);
+            }
         }
 
         #[test]

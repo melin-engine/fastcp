@@ -29,6 +29,13 @@ fn index_entry_is_dead(
         return true;
     }
     match (socket.local_endpoint(), socket.remote_endpoint()) {
+        // Unreachable from either call site today: both are gated on
+        // `accepts`, which demands an exact 4-tuple match from any socket that
+        // has a tuple, and `process` only ever adopts the tuple of the segment
+        // it just accepted. Kept because the tuple arrives here as four loose
+        // parameters, which invites a future caller that is not so gated —
+        // and because a silent mismatch would index a live connection under
+        // another connection's key.
         (Some(local), Some(remote)) => {
             local.addr != local_addr
                 || local.port != local_port
@@ -36,6 +43,8 @@ fn index_entry_is_dead(
                 || remote.port != remote_port
         }
         // Not connected: a listening socket, or one that just lost its tuple.
+        // Both endpoints read the same `tuple`, so this is the only other
+        // shape the pair can take.
         _ => true,
     }
 }

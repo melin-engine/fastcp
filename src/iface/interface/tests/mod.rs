@@ -156,7 +156,10 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
     );
 }
 
-/// Drive one TCP segment through `process_tcp`, discarding any reply.
+/// Drive one TCP segment through `process_tcp`.
+///
+/// Returns the reply's sequence and acknowledgement numbers, which is how a
+/// test learns the local ISN the socket picked for itself.
 #[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
 fn feed_tcp(
     iface: &mut Interface,
@@ -165,7 +168,7 @@ fn feed_tcp(
     control: TcpControl,
     seq_number: TcpSeqNumber,
     ack_number: Option<TcpSeqNumber>,
-) {
+) -> Option<(TcpSeqNumber, Option<TcpSeqNumber>)> {
     let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
     let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
 
@@ -192,17 +195,172 @@ fn feed_tcp(
         &ChecksumCapabilities::default(),
     );
 
-    let _reply = iface.inner.process_tcp(
-        sockets,
-        false,
-        IpRepr::Ipv6(Ipv6Repr {
-            src_addr: remote,
-            dst_addr: local,
-            next_header: IpProtocol::Tcp,
-            payload_len: tcp.buffer_len(),
-            hop_limit: 64,
-        }),
-        &tcp_bytes,
+    // The reply borrows `tcp_bytes`, so the numbers are copied out here rather
+    // than the packet being handed back.
+    iface
+        .inner
+        .process_tcp(
+            sockets,
+            false,
+            IpRepr::Ipv6(Ipv6Repr {
+                src_addr: remote,
+                dst_addr: local,
+                next_header: IpProtocol::Tcp,
+                payload_len: tcp.buffer_len(),
+                hop_limit: 64,
+            }),
+            &tcp_bytes,
+        )
+        .map(|packet| match packet.payload() {
+            IpPayload::Tcp(reply) => (reply.seq_number, reply.ack_number),
+            #[allow(unreachable_patterns)]
+            _ => panic!("process_tcp replied with a non-TCP payload"),
+        })
+}
+
+/// Let a TCP socket emit whatever it has queued, returning the segment's
+/// control flag and sequence numbers.
+///
+/// Replies to inbound segments are not what `process_tcp` returns — a SYN-ACK,
+/// or a FIN after `close()`, comes out of `dispatch` — so a test that needs
+/// either the locally chosen ISN or the socket's own send state to advance has
+/// to pump this.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
+fn dispatch_tcp(
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    handle: crate::iface::SocketHandle,
+) -> Option<(TcpControl, TcpSeqNumber, Option<TcpSeqNumber>)> {
+    use crate::socket::tcp;
+
+    let mut emitted = None;
+    let dispatched =
+        sockets
+            .get_mut::<tcp::Socket>(handle)
+            .dispatch(&mut iface.inner, |_cx, (_ip, tcp)| {
+                emitted = Some((tcp.control, tcp.seq_number, tcp.ack_number));
+                Ok::<(), ()>(())
+            });
+    assert_eq!(dispatched, Ok(()), "dispatch should not have failed");
+    emitted
+}
+
+/// TIME-WAIT must give its index slot back, even though the socket still owns
+/// the 4-tuple and still has to answer a retransmitted FIN for 2MSL. Holding a
+/// slot for the whole of 2MSL is the occupancy the table cannot afford; the
+/// linear scan covers the re-ACK perfectly well.
+///
+/// This is the `Closed | TimeWait` arm of `index_entry_is_dead`, which the
+/// re-listen test below never reaches — an RST in SYN-RECEIVED leaves the
+/// socket in LISTEN, so that one only exercises the tuple-loss arm.
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
+fn tcp_index_releases_the_slot_on_entering_time_wait() {
+    use crate::socket::tcp;
+
+    const REMOTE_ISN: TcpSeqNumber = TcpSeqNumber(-10001);
+    const REMOTE_PORT: u16 = 1024;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 64]),
+        tcp::SocketBuffer::new(vec![0; 64]),
+    );
+    let handle = sockets.add(socket);
+    sockets.get_mut::<tcp::Socket>(handle).listen(4243).unwrap();
+
+    // Handshake. The SYN-ACK is the only place the locally chosen ISN is
+    // visible, and every acknowledgement below is derived from it.
+    feed_tcp(
+        &mut iface,
+        &mut sockets,
+        REMOTE_PORT,
+        TcpControl::Syn,
+        REMOTE_ISN,
+        None,
+    );
+    let (control, local_isn, _) =
+        dispatch_tcp(&mut iface, &mut sockets, handle).expect("a SYN-ACK should have been emitted");
+    assert_eq!(control, TcpControl::Syn);
+    feed_tcp(
+        &mut iface,
+        &mut sockets,
+        REMOTE_PORT,
+        TcpControl::None,
+        REMOTE_ISN + 1,
+        Some(local_isn + 1),
+    );
+    assert_eq!(
+        sockets.get_mut::<tcp::Socket>(handle).state(),
+        tcp::State::Established
+    );
+    assert_eq!(iface.inner.tcp_socket_index.len(), 1);
+
+    // Close from this end, so the connection ends in TIME-WAIT rather than in
+    // CLOSED. The FIN has to actually go out: until it is dispatched the
+    // socket has no record of having sent it, and would answer the peer's
+    // acknowledgement of it as an ACK of something never sent.
+    sockets.get_mut::<tcp::Socket>(handle).close();
+    let (control, ..) =
+        dispatch_tcp(&mut iface, &mut sockets, handle).expect("a FIN should have been emitted");
+    assert_eq!(control, TcpControl::Fin);
+
+    // The FIN is acknowledged, then the peer sends its own.
+    feed_tcp(
+        &mut iface,
+        &mut sockets,
+        REMOTE_PORT,
+        TcpControl::None,
+        REMOTE_ISN + 1,
+        Some(local_isn + 2),
+    );
+    assert_eq!(
+        sockets.get_mut::<tcp::Socket>(handle).state(),
+        tcp::State::FinWait2
+    );
+    assert_eq!(
+        iface.inner.tcp_socket_index.len(),
+        1,
+        "FIN-WAIT-2 is still a live connection"
+    );
+
+    feed_tcp(
+        &mut iface,
+        &mut sockets,
+        REMOTE_PORT,
+        TcpControl::Fin,
+        REMOTE_ISN + 1,
+        Some(local_isn + 2),
+    );
+    assert_eq!(
+        sockets.get_mut::<tcp::Socket>(handle).state(),
+        tcp::State::TimeWait
+    );
+    assert_eq!(
+        iface.inner.tcp_socket_index.len(),
+        0,
+        "TIME-WAIT should not hold an index slot"
+    );
+
+    // Losing the slot must not lose the connection: a retransmitted FIN is
+    // still found by the linear scan and still re-acknowledged.
+    let reply = feed_tcp(
+        &mut iface,
+        &mut sockets,
+        REMOTE_PORT,
+        TcpControl::Fin,
+        REMOTE_ISN + 1,
+        Some(local_isn + 2),
+    );
+    assert_eq!(
+        reply,
+        Some((local_isn + 2, Some(REMOTE_ISN + 2))),
+        "the retransmitted FIN should have been re-acknowledged"
+    );
+    assert_eq!(
+        iface.inner.tcp_socket_index.len(),
+        0,
+        "answering from the scan must not re-index the connection"
     );
 }
 
