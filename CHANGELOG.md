@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-25
+
+Correctness release for the zero-copy RX path and the TCP socket index, plus the CI that should have been covering them. Three of the fixes below are for bugs introduced by this fork's own optimization work in March and missed because `ci.sh` could not compile anything but `cargo test --lib` after the crate was renamed.
+
+**If you enable `socket-tcp-zero-copy-rx`, note that the default `ZERO_COPY_RX_MAX_SEGMENTS` changes from 32 to 256**, which grows every `tcp::Socket` by roughly 9 KB. Set `zero-copy-rx-max-segments-32` (or the `SMOLTCP_ZERO_COPY_RX_MAX_SEGMENTS` env var) to keep the previous footprint.
+
 - Drop support for 16-bit pointer targets, and with it the `build_16bit` CI stage. fastcp targets x86-64 with DPDK; the stage had been failing since the O(1) socket index landed in March, went unnoticed for 33 commits because it was marked `continue-on-error` and was absent from the aggregate job's `needs`, and in exchange constrained every `usize` decision on the hot path. It was the only consumer of nightly `-Z build-std` and the tier-3 `msp430-none-elf` target.
 - ci
     - Fix the `smoltcp` → `fastcp` crate rename in the examples, benches, `utils/packet2pcap.rs`, the netsim test, and the doctests in `src/`. None of these compiled, so `ci.sh test`, `check`, `clippy` and `netsim` all aborted before running anything — `cargo test --lib` was the only thing that worked, which is why 7 broken doctests went unseen. `examples/utils.rs` also filtered log records on a `smoltcp::` target prefix that the crate no longer emits, silently discarding every line.
