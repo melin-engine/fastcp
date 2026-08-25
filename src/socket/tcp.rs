@@ -2842,12 +2842,7 @@ impl<'a> Socket<'a> {
                     DataSegmentResult::Reply(reply) => {
                         // Challenge ACK or similar — finalize what we have and return.
                         if batch.segments_processed > 0 {
-                            self.process_batch_finalize(
-                                cx,
-                                &batch,
-                                last_ip_repr.unwrap(),
-                                last_tcp_repr.unwrap(),
-                            );
+                            self.process_batch_finalize(cx, &batch);
                         }
                         return reply;
                     }
@@ -2858,12 +2853,7 @@ impl<'a> Socket<'a> {
             // Slow path: control segment or non-ESTABLISHED state.
             // Finalize any accumulated batch state first.
             if batch.segments_processed > 0 {
-                self.process_batch_finalize(
-                    cx,
-                    &batch,
-                    last_ip_repr.unwrap(),
-                    last_tcp_repr.unwrap(),
-                );
+                self.process_batch_finalize(cx, &batch);
                 batch = BatchAccumulator::default();
                 last_ip_repr = None;
                 last_tcp_repr = None;
@@ -2879,12 +2869,15 @@ impl<'a> Socket<'a> {
 
         // Finalize the batch.
         if batch.segments_processed > 0 {
-            self.process_batch_finalize(cx, &batch, last_ip_repr.unwrap(), last_tcp_repr.unwrap());
+            self.process_batch_finalize(cx, &batch);
 
             // Generate a single ACK reply if we have data to acknowledge.
-            if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
-                let ip = last_ip_repr.unwrap();
-                let tcp = last_tcp_repr.unwrap();
+            // `segments_processed` is only ever incremented on the path that
+            // also records these, so both are `Some` here; matching on them
+            // states that rather than asserting it.
+            if let (Some(ip), Some(tcp)) = (last_ip_repr, last_tcp_repr)
+                && (!self.assembler.is_empty() || !batch.assembler_was_empty_at_start)
+            {
                 return Some(self.ack_reply(ip, tcp));
             }
         }
@@ -2956,6 +2949,21 @@ impl<'a> Socket<'a> {
             }
         };
 
+        // --- Window update ---
+        //
+        // Applied per segment, ahead of the ACK block, for two reasons.
+        // Duplicate-ACK detection below tests it, and `process()` updates
+        // `remote_win_len` as each segment goes by: the second of two segments
+        // carrying the same window is not a window update, and would look like
+        // one if every segment in the batch were compared against the value
+        // from before the batch started.
+        let scale = self.remote_win_scale.unwrap_or(0);
+        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        let is_window_update = new_remote_win_len != self.remote_win_len;
+        self.remote_win_len = new_remote_win_len;
+        batch.last_window_len = Some(new_remote_win_len);
+        batch.is_window_update = batch.is_window_update || is_window_update;
+
         // --- ACK len computation (without RTT/congestion calls) ---
         let mut ack_len = 0;
         let mut ack_all = false;
@@ -2981,19 +2989,62 @@ impl<'a> Socket<'a> {
                 self.tx_waker.wake();
             }
 
+            // --- Duplicate ACK detection (must be per-segment) ---
+            //
+            // Deferring this to `process_batch_finalize` counted a whole burst
+            // of duplicate ACKs as a single observation — and, because that one
+            // observation takes the `_` arm below and merely records
+            // `local_rx_last_ack`, as no observation at all. Fast retransmit
+            // arms at exactly the third duplicate, and a peer sends its
+            // duplicates back to back, which is one RX burst: batching demoted
+            // every fast retransmit to an RTO timeout.
+            //
+            // This mirrors the same block in `process()`; the expensive
+            // per-ACK work (RTT estimation, congestion control on_ack) stays
+            // deferred, since only the duplicate bookkeeping is order-sensitive.
+            match self.local_rx_last_ack {
+                Some(last_rx_ack)
+                    if repr.payload.is_empty()
+                        && last_rx_ack == ack_number
+                        && ack_number < self.remote_last_seq
+                        && !is_window_update =>
+                {
+                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_duplicate_ack(cx.now());
+
+                    net_debug!(
+                        "received duplicate ACK for seq {} (duplicate nr {}{})",
+                        ack_number,
+                        self.local_rx_dup_acks,
+                        if self.local_rx_dup_acks == u8::MAX {
+                            "+"
+                        } else {
+                            ""
+                        }
+                    );
+
+                    if self.local_rx_dup_acks == 3 {
+                        self.timer.set_for_fast_retransmit();
+                        net_debug!("started fast retransmit");
+                    }
+                }
+                _ => {
+                    if self.local_rx_dup_acks > 0 {
+                        self.local_rx_dup_acks = 0;
+                        net_debug!("reset duplicate ACK count");
+                    }
+                    self.local_rx_last_ack = Some(ack_number);
+                }
+            }
+
             // Advance local_seq_no (must be per-segment for next ack_len computation).
             self.local_seq_no = ack_number;
             if self.remote_last_seq < self.local_seq_no {
                 self.remote_last_seq = self.local_seq_no;
             }
         }
-
-        // --- Window update (accumulate for finalize) ---
-        let scale = self.remote_win_scale.unwrap_or(0);
-        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
-        batch.last_window_len = Some(new_remote_win_len);
-        batch.is_window_update =
-            batch.is_window_update || new_remote_win_len != self.remote_win_len;
 
         // --- Timestamp (accumulate for finalize) ---
         if let Some(timestamp) = repr.timestamp {
@@ -3033,13 +3084,7 @@ impl<'a> Socket<'a> {
     /// Run the deferred bookkeeping after processing a batch of data segments.
     /// This covers RTT estimation, congestion control, timer management,
     /// duplicate ACK detection, and delayed ACK handling.
-    fn process_batch_finalize(
-        &mut self,
-        cx: &mut Context,
-        batch: &BatchAccumulator,
-        _last_ip_repr: &IpRepr,
-        last_repr: &TcpRepr,
-    ) {
+    fn process_batch_finalize(&mut self, cx: &mut Context, batch: &BatchAccumulator) {
         // RTT estimation + congestion control — once with final values.
         if let Some(ack_number) = batch.last_ack_number {
             self.rtte.on_ack(cx.now(), ack_number);
@@ -3061,32 +3106,8 @@ impl<'a> Socket<'a> {
                 .set_remote_window(new_remote_win_len);
         }
 
-        // Duplicate ACK detection — only the last segment matters.
-        if let Some(ack_number) = batch.last_ack_number {
-            let is_window_update = batch.is_window_update;
-            match self.local_rx_last_ack {
-                Some(last_rx_ack)
-                    if last_repr.payload.is_empty()
-                        && last_rx_ack == ack_number
-                        && ack_number < self.remote_last_seq
-                        && !is_window_update =>
-                {
-                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
-                    self.congestion_controller
-                        .inner_mut()
-                        .on_duplicate_ack(cx.now());
-                    if self.local_rx_dup_acks == 3 {
-                        self.timer.set_for_fast_retransmit();
-                    }
-                }
-                _ => {
-                    if self.local_rx_dup_acks > 0 {
-                        self.local_rx_dup_acks = 0;
-                    }
-                    self.local_rx_last_ack = Some(ack_number);
-                }
-            }
-        }
+        // Duplicate ACK detection is deliberately absent here: it is
+        // order-sensitive and runs per segment in `process_data_segment`.
 
         // Timestamp option.
         if let Some(tsval) = batch.last_timestamp_tsval {
@@ -3183,12 +3204,7 @@ impl<'a> Socket<'a> {
                     }
                     DataSegmentResult::Reply(reply) => {
                         if batch.segments_processed > 0 {
-                            self.process_batch_finalize(
-                                cx,
-                                &batch,
-                                last_ip_repr.unwrap(),
-                                last_tcp_repr.unwrap(),
-                            );
+                            self.process_batch_finalize(cx, &batch);
                         }
                         return reply;
                     }
@@ -3198,12 +3214,7 @@ impl<'a> Socket<'a> {
 
             // Slow path: control segment or non-ESTABLISHED state.
             if batch.segments_processed > 0 {
-                self.process_batch_finalize(
-                    cx,
-                    &batch,
-                    last_ip_repr.unwrap(),
-                    last_tcp_repr.unwrap(),
-                );
+                self.process_batch_finalize(cx, &batch);
                 batch = BatchAccumulator::default();
                 last_ip_repr = None;
                 last_tcp_repr = None;
@@ -3217,11 +3228,14 @@ impl<'a> Socket<'a> {
         }
 
         if batch.segments_processed > 0 {
-            self.process_batch_finalize(cx, &batch, last_ip_repr.unwrap(), last_tcp_repr.unwrap());
+            self.process_batch_finalize(cx, &batch);
 
-            if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
-                let ip = last_ip_repr.unwrap();
-                let tcp = last_tcp_repr.unwrap();
+            // `segments_processed` is only ever incremented on the path that
+            // also records these, so both are `Some` here; matching on them
+            // states that rather than asserting it.
+            if let (Some(ip), Some(tcp)) = (last_ip_repr, last_tcp_repr)
+                && (!self.assembler.is_empty() || !batch.assembler_was_empty_at_start)
+            {
                 return Some(self.ack_reply(ip, tcp));
             }
         }
@@ -3606,7 +3620,7 @@ impl<'a> Socket<'a> {
         let mut batch = BatchAccumulator::default();
         match self.process_data_segment_zero_copy(cx, ip_repr, repr, frame_handle, &mut batch) {
             DataSegmentResult::Ok => {
-                self.process_batch_finalize(cx, &batch, ip_repr, repr);
+                self.process_batch_finalize(cx, &batch);
                 if !self.assembler.is_empty() || !batch.assembler_was_empty_at_start {
                     return Some(self.ack_reply(ip_repr, repr));
                 }
@@ -7644,6 +7658,56 @@ mod test {
             &buf_batch[..n_batch],
             &buf_seq[..n_seq],
             "rx_buffer content mismatch"
+        );
+    }
+
+    /// Three duplicate ACKs must trigger fast retransmit whether the peer's
+    /// segments arrive one at a time or together in one RX burst.
+    ///
+    /// `process_batch_finalize` runs duplicate-ACK detection once per batch,
+    /// off `batch.last_ack_number` alone, so a burst of N duplicates counts as
+    /// one. Fast retransmit fires at exactly 3, and a DPDK RX burst delivers
+    /// precisely this shape — three dup ACKs in a single poll — so batching
+    /// silently demotes fast retransmit to an RTO timeout.
+    ///
+    /// Differential against the sequential path, like
+    /// `test_process_batch_differential_vs_sequential`, which compares only
+    /// sequence numbers and buffers and so cannot see this.
+    #[test]
+    fn test_process_batch_counts_duplicate_acks_like_sequential() {
+        let mut s_batch = socket_established();
+        let mut s_seq = socket_established();
+        s_batch.cx.set_now(Instant::from_millis(0));
+        s_seq.cx.set_now(Instant::from_millis(0));
+
+        // Data in flight, so an ACK below `remote_last_seq` reads as a
+        // duplicate rather than as new information.
+        for s in [&mut s_batch, &mut s_seq] {
+            s.send_slice(b"abcdef").unwrap();
+            let _ = s.socket.dispatch(&mut s.cx, |_, _| Ok::<(), ()>(()));
+        }
+
+        let dup = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[],
+            ..SEND_TEMPL
+        };
+        let segments: Vec<(IpRepr, TcpRepr)> = (0..3).map(|_| (RECV_IP_TEMPL, dup)).collect();
+
+        let _ = s_batch.socket.process_batch(&mut s_batch.cx, &segments);
+        for (ip, tcp) in &segments {
+            let _ = s_seq.socket.process(&mut s_seq.cx, ip, tcp);
+        }
+
+        assert_eq!(
+            s_batch.local_rx_dup_acks, s_seq.local_rx_dup_acks,
+            "batched duplicate ACKs were not counted like sequential ones"
+        );
+        assert_eq!(
+            matches!(s_batch.timer, Timer::FastRetransmit),
+            matches!(s_seq.timer, Timer::FastRetransmit),
+            "the two paths disagree on whether fast retransmit is armed"
         );
     }
 
