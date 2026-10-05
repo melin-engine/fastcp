@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-10-05
+
+- tcp
+    - Cap the zero-window probe interval at the keep-alive interval when keep-alive is enabled. While a peer advertises a zero window and data is queued, the socket sends zero-window probes instead of keep-alives, and the probe delay doubled up to 60 s regardless of keep-alive. Once that delay exceeded the socket's timeout, the timeout fired before the next probe could draw an answer, so a peer that was alive and answering every probe was reset: with `set_keep_alive(Some(1 s))` and `set_timeout(Some(5 s))`, about 12 s after the peer's window closed. Probes are now never more than one keep-alive interval apart, so such a peer stays connected for as long as it answers, while a peer that stops answering still times out as before. Sockets without keep-alive are unaffected.
+    - Known limitation: with a timeout set but keep-alive disabled, the probe backoff still grows past the timeout, so a peer answering every probe with a zero window can still be aborted, although RFC 1122 section 4.2.2.17 says it SHOULD NOT be. Enable keep-alive with an interval shorter than the timeout to avoid this; the `set_timeout` and `set_keep_alive` docs now describe it.
+
 ## [0.13.1] - 2026-08-25
 
 Correctness release for the zero-copy RX path and the TCP socket index, plus the CI that should have been covering them. Three of the fixes below are for bugs introduced by this fork's own optimization work in March and missed because `ci.sh` could not compile anything but `cargo test --lib` after the crate was renamed.

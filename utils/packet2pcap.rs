@@ -1,6 +1,6 @@
-use getopts::Options;
 use fastcp::phy::{PcapLinkType, PcapSink};
 use fastcp::time::Instant;
+use getopts::Options;
 use std::env;
 use std::fs::File;
 use std::io::{self, Read};
