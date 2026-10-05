@@ -162,7 +162,10 @@ impl<'a> SocketSet<'a> {
     /// handles between an explicit `remove()` and the next packet that
     /// would refresh the index.
     pub(crate) fn try_get_socket_mut(&mut self, handle: SocketHandle) -> Option<&mut Socket<'a>> {
-        self.sockets[handle.0].inner.as_mut().map(|item| &mut item.socket)
+        self.sockets[handle.0]
+            .inner
+            .as_mut()
+            .map(|item| &mut item.socket)
     }
 
     /// Remove a socket from the set, without changing its state.

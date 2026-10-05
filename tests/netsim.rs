@@ -4,14 +4,14 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::Mutex;
 
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha20Rng;
 use fastcp::iface::{Config, Interface, SocketSet};
 use fastcp::phy::Tracer;
 use fastcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use fastcp::socket::tcp;
 use fastcp::time::{Duration, Instant};
 use fastcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 
 const MAC_A: HardwareAddress = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 1]));
 const MAC_B: HardwareAddress = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 2]));
