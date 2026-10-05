@@ -373,6 +373,18 @@ enum Timer {
     },
 }
 
+/// Cap a zero-window probe delay at the keep-alive interval, if one is set.
+///
+/// With keep-alive enabled, a zero-window probe doubles as the keep-alive: the timer is in
+/// `ZeroWindowProbe` rather than `Idle`, so no separate keep-alive is ever sent. Without
+/// keep-alive the delay is returned unchanged.
+fn cap_at_keep_alive(delay: Duration, keep_alive: Option<Duration>) -> Duration {
+    match keep_alive {
+        Some(interval) => delay.min(interval),
+        None => delay,
+    }
+}
+
 const ACK_DELAY_DEFAULT: Duration = Duration::from_millis(10);
 const CLOSE_DELAY: Duration = Duration::from_millis(10_000);
 
@@ -473,6 +485,20 @@ impl Timer {
         }
     }
 
+    /// Shorten an armed zero-window probe timer to the keep-alive `interval`, keeping the
+    /// time the current probe period started. Used when keep-alive is enabled or shortened
+    /// while probing, so the cap takes effect for the pending probe, not only the next one.
+    fn cap_zero_window_probe(&mut self, interval: Duration) {
+        if let Timer::ZeroWindowProbe { expires_at, delay } = *self
+            && delay > interval
+        {
+            *self = Timer::ZeroWindowProbe {
+                expires_at: expires_at - delay + interval,
+                delay: interval,
+            }
+        }
+    }
+
     fn set_for_zero_window_probe(&mut self, timestamp: Instant, delay: Duration) {
         *self = Timer::ZeroWindowProbe {
             expires_at: timestamp + delay,
@@ -480,9 +506,19 @@ impl Timer {
         }
     }
 
-    fn rewind_zero_window_probe(&mut self, timestamp: Instant) {
+    /// Re-arm the zero-window probe timer after a probe was sent, doubling the delay.
+    ///
+    /// The delay is capped at `RTTE_MAX_RTO` and, when keep-alive is enabled, at the
+    /// keep-alive `interval`. A peer answering probes with a zero window never acknowledges
+    /// anything, so the only liveness signal it gives is the answer to each probe; were the
+    /// backoff allowed past the keep-alive interval, it would eventually exceed the socket
+    /// timeout and an answering peer would be aborted as dead.
+    fn rewind_zero_window_probe(&mut self, timestamp: Instant, interval: Option<Duration>) {
         if let Timer::ZeroWindowProbe { mut delay, .. } = *self {
-            delay = (delay * 2).min(Duration::from_millis(RTTE_MAX_RTO as _));
+            delay = cap_at_keep_alive(
+                (delay * 2).min(Duration::from_millis(RTTE_MAX_RTO as _)),
+                interval,
+            );
             *self = Timer::ZeroWindowProbe {
                 expires_at: timestamp + delay,
                 delay,
@@ -1176,6 +1212,18 @@ impl<'a> Socket<'a> {
     ///     endpoint exceeds the specified duration between any two packets it sends;
     ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
     ///     the specified duration between any two packets it sends.
+    ///
+    /// # Zero-window peers
+    ///
+    /// A peer that advertises a zero window while data is queued is probed with exponential
+    /// backoff, and its answers to those probes are what keeps the connection from timing
+    /// out. With [keep-alive](#method.set_keep_alive) enabled, the probe interval is capped at
+    /// the keep-alive interval, so set the keep-alive interval shorter than the timeout to keep
+    /// such a peer alive for as long as it keeps answering.
+    ///
+    /// Known limitation: with a timeout set but keep-alive disabled, the probe backoff
+    /// eventually exceeds the timeout and a peer that is still answering every probe with a
+    /// zero window is aborted, although RFC 1122 section 4.2.2.17 says it SHOULD NOT be.
     pub fn set_timeout(&mut self, duration: Option<Duration>) {
         self.timeout = duration
     }
@@ -1278,12 +1326,21 @@ impl<'a> Socket<'a> {
     ///
     /// The keep-alive functionality together with the timeout functionality allows to react
     /// to these error conditions.
+    ///
+    /// While the remote endpoint advertises a zero window and data is queued, no keep-alive
+    /// packets are sent; zero-window probes take their place, and their interval is capped at
+    /// the keep-alive interval. The keep-alive interval should therefore be shorter than the
+    /// [timeout](#method.set_timeout), otherwise a peer that answers every probe can still be
+    /// aborted. See [set_timeout](#method.set_timeout) for the case where keep-alive is disabled.
     pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
         self.keep_alive = interval;
-        if self.keep_alive.is_some() {
+        if let Some(interval) = self.keep_alive {
             // If the connection is idle and we've just set the option, it would not take effect
             // until the next packet, unless we wind up the timer explicitly.
             self.timer.set_keep_alive();
+            // Likewise, a zero-window probe already armed with a longer delay would otherwise
+            // keep it until the next probe, possibly outliving the timeout.
+            self.timer.cap_zero_window_probe(interval);
         }
     }
 
@@ -1710,7 +1767,9 @@ impl<'a> Socket<'a> {
             // if remote win is zero and we go from having no data to some data pending to
             // send, start the zero window probe timer.
             if self.remote_win_len == 0 && self.timer.is_idle() {
-                let delay = self.rtte.retransmission_timeout();
+                // Spelled out field by field rather than through `zero_window_probe_delay()`:
+                // `tx_buffer` is still mutably borrowed by the caller's closure result here.
+                let delay = cap_at_keep_alive(self.rtte.retransmission_timeout(), self.keep_alive);
                 tcp_trace!("starting zero-window-probe timer for t+{}", delay);
 
                 // We don't have access to the current time here, so use Instant::ZERO instead.
@@ -2704,7 +2763,7 @@ impl<'a> Socket<'a> {
             && !self.tx_buffer.is_empty()
             && (self.timer.is_idle() || ack_len > 0)
         {
-            let delay = self.rtte.retransmission_timeout();
+            let delay = self.zero_window_probe_delay();
             tcp_trace!("starting zero-window-probe timer for t+{}", delay);
             self.timer.set_for_zero_window_probe(cx.now(), delay);
         }
@@ -3135,7 +3194,7 @@ impl<'a> Socket<'a> {
             && !self.tx_buffer.is_empty()
             && (self.timer.is_idle() || batch.total_ack_len > 0)
         {
-            let delay = self.rtte.retransmission_timeout();
+            let delay = self.zero_window_probe_delay();
             self.timer.set_for_zero_window_probe(cx.now(), delay);
         }
         if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
@@ -3631,6 +3690,12 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Initial delay of the zero-window probe timer: the current RTO, capped at the
+    /// keep-alive interval if one is set (see `Timer::rewind_zero_window_probe`).
+    fn zero_window_probe_delay(&self) -> Duration {
+        cap_at_keep_alive(self.rtte.retransmission_timeout(), self.keep_alive)
+    }
+
     fn timed_out(&self, timestamp: Instant) -> bool {
         match (self.remote_last_ts, self.timeout) {
             (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
@@ -4116,7 +4181,8 @@ impl<'a> Socket<'a> {
 
         // Leave the rest of the state intact if sending a zero-window probe.
         if is_zero_window_probe {
-            self.timer.rewind_zero_window_probe(cx.now());
+            self.timer
+                .rewind_zero_window_probe(cx.now(), self.keep_alive);
             return Ok(false);
         }
 
@@ -9585,6 +9651,309 @@ mod test {
                 payload: &b"b"[..],
                 ..RECV_TEMPL
             }]
+        );
+    }
+
+    /// The zero-window probe for the first queued byte, as sent by the socket under test.
+    fn zwp_probe() -> TcpRepr<'static> {
+        TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"a"[..],
+            ..RECV_TEMPL
+        }
+    }
+
+    /// A peer's answer to a zero-window probe: still a zero window, probe byte not taken.
+    fn zwp_answer() -> TcpRepr<'static> {
+        TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 0,
+            ..SEND_TEMPL
+        }
+    }
+
+    /// Established socket with keep-alive and timeout set, data queued and a peer that has
+    /// just advertised a zero window at t=0, arming the zero-window probe timer.
+    fn socket_zero_window_keep_alive(keep_alive: Duration, timeout: Duration) -> TestSocket {
+        let mut s = socket_established();
+        s.set_keep_alive(Some(keep_alive));
+        s.set_timeout(Some(timeout));
+        s.send_slice(b"abcdef123456!@#$%^").unwrap();
+        send!(s, time 0, zwp_answer());
+        assert!(s.timer.is_zero_window_probe());
+        s
+    }
+
+    #[test]
+    fn test_zero_window_probe_capped_at_keep_alive_peer_answers() {
+        // A live peer stuck at a zero window answers every probe. With keep-alive at 1 s and
+        // a 5 s timeout, the uncapped backoff (probes at 1, 3, 7, 15 s) let the timeout fire
+        // at 7 + 5 = 12 s before the probe due at 15 s, aborting a peer that was answering.
+        let mut s =
+            socket_zero_window_keep_alive(Duration::from_millis(1000), Duration::from_millis(5000));
+
+        for i in 1..=30 {
+            let probe_at = i * 1000;
+            recv_nothing!(s, time probe_at - 1);
+            recv!(s, time probe_at, [zwp_probe()]);
+            assert_eq!(
+                s.socket.poll_at(&mut s.cx),
+                PollAt::Time(Instant::from_millis(probe_at + 1000)),
+                "probe {i}: next probe must be due within the keep-alive interval"
+            );
+            send!(s, time probe_at + 10, zwp_answer());
+            assert_eq!(s.state, State::Established, "probe {i}");
+            assert!(s.timer.is_zero_window_probe(), "probe {i}");
+        }
+    }
+
+    #[test]
+    fn test_zero_window_probe_capped_at_keep_alive_dead_peer_times_out() {
+        let mut s =
+            socket_zero_window_keep_alive(Duration::from_millis(1000), Duration::from_millis(5000));
+
+        // The peer answers the first three probes...
+        for i in 1..=3 {
+            recv!(s, time i * 1000, [zwp_probe()]);
+            send!(s, time i * 1000 + 10, zwp_answer());
+        }
+
+        // ...then goes silent. Probes continue at the keep-alive interval until the timeout,
+        // counted from the last answer at 3010 ms, expires.
+        for probe_at in [4000, 5000, 6000, 7000, 8000] {
+            recv_nothing!(s, time probe_at - 1);
+            recv!(s, time probe_at, [zwp_probe()]);
+        }
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(8010))
+        );
+        recv_nothing!(s, time 8009);
+        recv!(s, time 8010, [TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }]);
+        assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
+    fn test_zero_window_probe_initial_delay_capped_at_keep_alive() {
+        // The RTO is 1 s, but the first probe must not wait longer than the keep-alive.
+        let mut s =
+            socket_zero_window_keep_alive(Duration::from_millis(300), Duration::from_millis(5000));
+
+        for probe_at in [300, 600, 900, 1200] {
+            recv_nothing!(s, time probe_at - 1);
+            recv!(s, time probe_at, [zwp_probe()]);
+            send!(s, time probe_at + 10, zwp_answer());
+        }
+
+        // A probe byte accepted against a still-zero window restarts the timer at the
+        // capped delay, not at the RTO.
+        send!(s, time 1300, TcpRepr {
+            ack_number: Some(LOCAL_SEQ + 2),
+            ..zwp_answer()
+        });
+        recv_nothing!(s, time 1599);
+        recv!(s, time 1600, [TcpRepr {
+            seq_number: LOCAL_SEQ + 2,
+            payload: &b"b"[..],
+            ..zwp_probe()
+        }]);
+    }
+
+    #[test]
+    fn test_zero_window_probe_initial_delay_capped_at_keep_alive_on_send() {
+        // Data queued against a zero window is probed at once, then at the keep-alive.
+        // `send_slice` has no clock and arms the timer from t=0, so the first probe is only
+        // "at once" when queued later than one (capped) delay after t=0, as it always is
+        // outside of tests.
+        let mut s = socket_established();
+        s.set_keep_alive(Some(Duration::from_millis(300)));
+        s.set_timeout(Some(Duration::from_millis(5000)));
+        send!(s, time 0, zwp_answer());
+        assert!(!s.timer.is_zero_window_probe());
+        s.send_slice(b"abcdef123456!@#$%^").unwrap();
+        assert_eq!(
+            s.timer,
+            Timer::ZeroWindowProbe {
+                expires_at: Instant::from_millis(300),
+                delay: Duration::from_millis(300),
+            }
+        );
+
+        recv!(s, time 5000, [zwp_probe()]);
+        recv_nothing!(s, time 5299);
+        recv!(s, time 5300, [zwp_probe()]);
+        recv_nothing!(s, time 5599);
+        recv!(s, time 5600, [zwp_probe()]);
+    }
+
+    #[test]
+    fn test_zero_window_probe_initial_delay_capped_at_keep_alive_batch() {
+        // Same as the `process()` path, but with the zero window arriving through the batch
+        // ingress path, which arms the probe timer separately.
+        let mut s = socket_established();
+        s.set_keep_alive(Some(Duration::from_millis(300)));
+        s.set_timeout(Some(Duration::from_millis(5000)));
+        s.send_slice(b"abcdef123456!@#$%^").unwrap();
+        s.cx.set_now(Instant::from_millis(0));
+        let reply = s
+            .socket
+            .process_batch(&mut s.cx, &[(RECV_IP_TEMPL, zwp_answer())]);
+        assert!(reply.is_none());
+        assert!(s.timer.is_zero_window_probe());
+
+        recv_nothing!(s, time 299);
+        recv!(s, time 300, [zwp_probe()]);
+        recv_nothing!(s, time 599);
+        recv!(s, time 600, [zwp_probe()]);
+    }
+
+    #[test]
+    fn test_zero_window_probe_capped_when_keep_alive_set_while_probing() {
+        // Keep-alive enabled while the probe backoff has already grown past it: the pending
+        // probe is pulled in, not only the ones after it.
+        let mut s = socket_established();
+        s.set_timeout(Some(Duration::from_millis(5000)));
+        s.send_slice(b"abcdef123456!@#$%^").unwrap();
+        send!(s, time 0, zwp_answer());
+        for probe_at in [1000, 3000] {
+            recv!(s, time probe_at, [zwp_probe()]);
+            send!(s, time probe_at + 10, zwp_answer());
+        }
+        // Next probe due at 3000 + 4000 = 7000; keep-alive of 1 s pulls it in to 4000.
+        s.set_keep_alive(Some(Duration::from_millis(1000)));
+        assert_eq!(
+            s.timer,
+            Timer::ZeroWindowProbe {
+                expires_at: Instant::from_millis(4000),
+                delay: Duration::from_millis(1000),
+            }
+        );
+        recv_nothing!(s, time 3999);
+        recv!(s, time 4000, [zwp_probe()]);
+        send!(s, time 4010, zwp_answer());
+        recv_nothing!(s, time 4999);
+        recv!(s, time 5000, [zwp_probe()]);
+
+        // A longer keep-alive never pushes the pending probe out.
+        s.set_keep_alive(Some(Duration::from_millis(30_000)));
+        assert_eq!(
+            s.timer,
+            Timer::ZeroWindowProbe {
+                expires_at: Instant::from_millis(6000),
+                delay: Duration::from_millis(1000),
+            }
+        );
+    }
+
+    #[test]
+    fn test_zero_window_probe_backoff_without_keep_alive() {
+        // Without keep-alive, the probe delay doubles up to RTTE_MAX_RTO, unchanged from
+        // 0.13.1, even though the peer answers every probe.
+        let mut s = socket_established();
+        s.send_slice(b"abcdef123456!@#$%^").unwrap();
+        send!(s, time 0, zwp_answer());
+
+        // Delays 1, 2, 4, 8, 16, 32 s, then capped at 60 s.
+        let max_rto = RTTE_MAX_RTO as i64;
+        let mut probe_at = 0;
+        for delay in [
+            1000, 2000, 4000, 8000, 16000, 32000, max_rto, max_rto, max_rto,
+        ] {
+            probe_at += delay;
+            recv_nothing!(s, time probe_at - 1);
+            recv!(s, time probe_at, [zwp_probe()]);
+            send!(s, time probe_at + 10, zwp_answer());
+            assert_eq!(s.state, State::Established);
+        }
+    }
+
+    #[test]
+    fn test_zero_window_probe_backoff_keep_alive_above_max_rto() {
+        // A keep-alive interval longer than RTTE_MAX_RTO does not raise the cap.
+        let ka = Duration::from_millis(RTTE_MAX_RTO as u64 * 2);
+        let max_rto = Duration::from_millis(RTTE_MAX_RTO as u64);
+        let mut timer = Timer::new();
+        timer.set_for_zero_window_probe(Instant::ZERO, Duration::from_millis(1000));
+        for _ in 0..10 {
+            timer.rewind_zero_window_probe(Instant::ZERO, Some(ka));
+        }
+        assert_eq!(
+            timer,
+            Timer::ZeroWindowProbe {
+                expires_at: Instant::ZERO + max_rto,
+                delay: max_rto,
+            }
+        );
+        timer.rewind_zero_window_probe(Instant::ZERO, None);
+        assert_eq!(
+            timer,
+            Timer::ZeroWindowProbe {
+                expires_at: Instant::ZERO + max_rto,
+                delay: max_rto,
+            }
+        );
+        timer.rewind_zero_window_probe(Instant::ZERO, Some(Duration::from_millis(1000)));
+        assert_eq!(
+            timer,
+            Timer::ZeroWindowProbe {
+                expires_at: Instant::from_millis(1000),
+                delay: Duration::from_millis(1000),
+            }
+        );
+    }
+
+    #[test]
+    fn test_zero_window_probe_capped_at_keep_alive_recovers_when_window_opens() {
+        let mut s =
+            socket_zero_window_keep_alive(Duration::from_millis(1000), Duration::from_millis(5000));
+
+        for i in 1..=8 {
+            recv!(s, time i * 1000, [zwp_probe()]);
+            send!(s, time i * 1000 + 10, zwp_answer());
+        }
+
+        // The peer takes the probe byte and opens its window: the probe timer stops and
+        // queued data flows.
+        send!(s, time 8020, TcpRepr {
+            ack_number: Some(LOCAL_SEQ + 2),
+            window_len: 6,
+            ..zwp_answer()
+        });
+        assert!(!s.timer.is_zero_window_probe());
+        recv!(s, time 8020, [TcpRepr {
+            seq_number: LOCAL_SEQ + 2,
+            payload: &b"bcdef1"[..],
+            ..zwp_probe()
+        }]);
+        send!(s, time 8030, TcpRepr {
+            ack_number: Some(LOCAL_SEQ + 8),
+            window_len: 64,
+            ..zwp_answer()
+        });
+        recv!(s, time 8030, [TcpRepr {
+            seq_number: LOCAL_SEQ + 8,
+            payload: &b"23456!@#$%^"[..],
+            ..zwp_probe()
+        }]);
+        send!(s, time 8040, TcpRepr {
+            ack_number: Some(LOCAL_SEQ + 19),
+            window_len: 64,
+            ..zwp_answer()
+        });
+        assert!(s.tx_buffer.is_empty());
+        assert_eq!(s.state, State::Established);
+
+        // Back to idle: the regular keep-alive takes over again.
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(9040))
         );
     }
 
